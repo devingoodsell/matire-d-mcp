@@ -451,20 +451,22 @@ class DatabaseManager:
             date=row["date"],
             party_size=row["party_size"],
             companions=json.loads(row["companions"]) if row["companions"] else [],
+            cuisine=row.get("cuisine"),
             source=row["source"],
         )
 
     async def log_visit(self, visit: Visit) -> int:
         cursor = await self.execute(
             """INSERT INTO visits
-               (restaurant_id, restaurant_name, date, party_size, companions, source)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               (restaurant_id, restaurant_name, date, party_size, companions, cuisine, source)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
             (
                 visit.restaurant_id,
                 visit.restaurant_name,
                 visit.date,
                 visit.party_size,
                 json.dumps(visit.companions),
+                visit.cuisine,
                 visit.source,
             ),
         )
@@ -515,6 +517,87 @@ class DatabaseManager:
                 review.notes,
             ),
         )
+
+    async def get_visit_by_restaurant_name(self, name: str) -> Visit | None:
+        """Find the most recent visit matching a restaurant name."""
+        row = await self.fetch_one(
+            """SELECT * FROM visits
+               WHERE LOWER(restaurant_name) LIKE LOWER(?)
+               ORDER BY date DESC LIMIT 1""",
+            (f"%{name}%",),
+        )
+        if not row:
+            return None
+        return self._row_to_visit(row)
+
+    async def get_visit_review(self, visit_id: int) -> VisitReview | None:
+        """Get the review for a specific visit."""
+        row = await self.fetch_one(
+            "SELECT * FROM visit_reviews WHERE visit_id = ?", (visit_id,)
+        )
+        if not row:
+            return None
+        return VisitReview(
+            visit_id=row["visit_id"],
+            would_return=bool(row["would_return"]),
+            overall_rating=row["overall_rating"],
+            ambiance_rating=row["ambiance_rating"],
+            noise_level=row["noise_level"],
+            notes=row["notes"],
+        )
+
+    async def get_restaurant_reviews(self, restaurant_id: str) -> list[VisitReview]:
+        """Get all reviews for visits to a specific restaurant."""
+        rows = await self.fetch_all(
+            """SELECT vr.* FROM visit_reviews vr
+               JOIN visits v ON vr.visit_id = v.id
+               WHERE v.restaurant_id = ?""",
+            (restaurant_id,),
+        )
+        return [
+            VisitReview(
+                visit_id=r["visit_id"],
+                would_return=bool(r["would_return"]),
+                overall_rating=r["overall_rating"],
+                ambiance_rating=r["ambiance_rating"],
+                noise_level=r["noise_level"],
+                notes=r["notes"],
+            )
+            for r in rows
+        ]
+
+    async def get_recency_penalties(self, days: int = 14) -> dict[str, float]:
+        """Return penalty scores (0-1) for cuisines based on recent visits.
+
+        Higher penalty = visited more recently.
+        Cuisines not visited get 0 penalty.
+        """
+        rows = await self.fetch_all(
+            """SELECT v.cuisine, rc.cuisine as cached_cuisine,
+                      julianday('now') - julianday(v.date) as days_ago
+               FROM visits v
+               LEFT JOIN restaurant_cache rc ON v.restaurant_id = rc.id
+               WHERE v.date >= date('now', ?)
+               ORDER BY v.date DESC""",
+            (f"-{days} days",),
+        )
+        penalties: dict[str, float] = {}
+        for r in rows:
+            # Get cuisine from visit or from cached restaurant
+            cuisine_str = r["cuisine"]
+            if not cuisine_str and r["cached_cuisine"]:
+                cuisine_list = json.loads(r["cached_cuisine"])
+                cuisine_str = cuisine_list[0] if cuisine_list else None
+            if not cuisine_str:
+                continue
+
+            cuisine_lower = cuisine_str.lower()
+            days_ago = max(r["days_ago"], 0)
+            penalty = max(0.0, 1.0 - (days_ago / days))
+            # Keep the highest penalty (most recent visit)
+            if cuisine_lower not in penalties or penalty > penalties[cuisine_lower]:
+                penalties[cuisine_lower] = penalty
+        return penalties
 
     async def get_recent_cuisines(self, days: int = 7) -> list[str]:
         rows = await self.fetch_all(

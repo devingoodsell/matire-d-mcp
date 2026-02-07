@@ -101,7 +101,25 @@ def register_search_tools(mcp: FastMCP) -> None:
                     "Use 'home', 'work', or a valid NYC address."
                 )
 
-        # ── 2. Build search query ───────────────────────────────────────
+        # ── 2. Weather check for outdoor seating ──────────────────────
+        weather_note = ""
+        if outdoor_seating and settings.openweather_api_key:
+            try:
+                from src.clients.weather import WeatherClient
+
+                weather_client = WeatherClient(settings.openweather_api_key)
+                weather = await weather_client.get_weather(user_lat, user_lng)
+                if not weather.outdoor_suitable:
+                    outdoor_seating = False
+                    weather_note = (
+                        f"Note: {weather.description.capitalize()} "
+                        f"({weather.temperature_f:.0f}°F). "
+                        "Showing indoor options instead.\n\n"
+                    )
+            except Exception:  # noqa: BLE001
+                logger.warning("Weather check failed, skipping")
+
+        # ── 3. Build search query ───────────────────────────────────────
         if query:
             search_query = f"{query} New York"
         elif cuisine:
@@ -112,7 +130,7 @@ def register_search_tools(mcp: FastMCP) -> None:
         if outdoor_seating:
             search_query += " outdoor seating"
 
-        # ── 3. Load user preferences for filtering ──────────────────────
+        # ── 4. Load user preferences for filtering ──────────────────────
         prefs = await db.get_preferences()
         cuisine_prefs = await db.get_cuisine_preferences()
         price_prefs = await db.get_price_preferences()
@@ -133,7 +151,7 @@ def register_search_tools(mcp: FastMCP) -> None:
                 p.price_level.value for p in price_prefs if p.acceptable
             }
 
-        # ── 4. Search via Google Places ─────────────────────────────────
+        # ── 5. Search via Google Places ─────────────────────────────────
         # Convert walk limit to radius: 83 m/min × walk_limit / 1.3 manhattan factor
         radius_m = int(walk_limit * 83 / 1.3)
         client = GooglePlacesClient(
@@ -151,7 +169,7 @@ def register_search_tools(mcp: FastMCP) -> None:
         for r in results:
             await db.cache_restaurant(r)
 
-        # ── 5. Filter results ───────────────────────────────────────────
+        # ── 6. Filter results ───────────────────────────────────────────
         filtered: list[Restaurant] = []
         for r in results:
             # Blacklist check
@@ -174,28 +192,65 @@ def register_search_tools(mcp: FastMCP) -> None:
 
             filtered.append(r)
 
-        # ── 6. Sort by rating (desc), then distance ─────────────────────
+        # ── 7. Recency-aware sorting ────────────────────────────────────
+        recency_penalties = await db.get_recency_penalties(days=14)
+        recency_notes: list[str] = []
+
         def sort_key(r: Restaurant) -> tuple[float, float]:
             rating = -(r.rating or 0.0)
             dist = walking_minutes(user_lat, user_lng, r.lat, r.lng)  # type: ignore[arg-type]
-            return (rating, dist)
+
+            # Apply recency penalty to deprioritize recently-visited cuisines
+            penalty = 0.0
+            if r.cuisine:
+                for c in r.cuisine:
+                    p = recency_penalties.get(c.lower(), 0.0)
+                    if p > penalty:
+                        penalty = p
+            # Penalty shifts rating: 0.8 penalty → effectively -0.8 rating
+            adjusted_rating = rating + penalty
+
+            return (adjusted_rating, dist)
 
         filtered.sort(key=sort_key)
         filtered = filtered[:max_results]
 
+        # Check which results have recency penalties to note
+        for r in filtered:
+            if r.cuisine:
+                for c in r.cuisine:
+                    penalty = recency_penalties.get(c.lower(), 0.0)
+                    if penalty >= 0.5:
+                        days_approx = int((1.0 - penalty) * 14)
+                        note = (
+                            f"You had {c} ~{days_approx} days ago — "
+                            "showing other options first"
+                        )
+                        if note not in recency_notes:
+                            recency_notes.append(note)
+
         if not filtered:
             return "No restaurants found matching your criteria. Try broadening your search."
 
-        # ── 7. Format output ────────────────────────────────────────────
+        # ── 8. Format output ────────────────────────────────────────────
         cuisine_label = f" {cuisine}" if cuisine else ""
         header = f"Found {len(filtered)}{cuisine_label} restaurant"
         if len(filtered) != 1:
             header += "s"
         header += f" near {location}:\n"
 
-        formatted: list[str] = [header]
+        formatted: list[str] = []
+        if weather_note:
+            formatted.append(weather_note)
+        formatted.append(header)
+
         for i, r in enumerate(filtered, 1):
             walk = walking_minutes(user_lat, user_lng, r.lat, r.lng)  # type: ignore[arg-type]
             formatted.append(_format_result(i, r, walk))
+
+        if recency_notes:
+            formatted.append("")
+            for note in recency_notes:
+                formatted.append(f"({note})")
 
         return "\n\n".join(formatted)

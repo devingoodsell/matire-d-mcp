@@ -15,7 +15,10 @@ from tests.factories import make_location, make_restaurant, make_user_preference
 @pytest.fixture
 def mock_settings():
     """Mock settings with a test Google API key."""
-    return type("Settings", (), {"google_api_key": "test-key"})()
+    return type("Settings", (), {
+        "google_api_key": "test-key",
+        "openweather_api_key": None,
+    })()
 
 
 @pytest.fixture
@@ -792,3 +795,343 @@ class TestSearchRestaurants:
                 result = await client.call_tool("search_restaurants", {})
         text = str(result)
         assert "No restaurants found" in text
+
+
+# ── EPIC-07: Weather-aware outdoor seating tests ─────────────────────────────
+
+
+class TestWeatherAwareSearch:
+    """Tests for the weather check when outdoor_seating=True."""
+
+    @pytest.fixture
+    def weather_search_mcp(self, db, monkeypatch):
+        """Return (mcp, db) with weather API key configured."""
+        monkeypatch.setenv("OPENWEATHER_API_KEY", "test-weather-key")
+        from src.config import reset_settings
+
+        reset_settings()
+
+        test_mcp = FastMCP("test")
+        db_patch = patch("src.tools.search.get_db", return_value=db)
+        db_patch.start()
+        register_search_tools(test_mcp)
+        yield test_mcp, db
+        db_patch.stop()
+        reset_settings()
+
+    @pytest.fixture
+    def no_key_search_mcp(self, db, monkeypatch):
+        """Return (mcp, db) WITHOUT weather API key."""
+        monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
+        from src.config import reset_settings
+
+        reset_settings()
+
+        test_mcp = FastMCP("test")
+        db_patch = patch("src.tools.search.get_db", return_value=db)
+        db_patch.start()
+        register_search_tools(test_mcp)
+        yield test_mcp, db
+        db_patch.stop()
+        reset_settings()
+
+    async def test_bad_weather_flips_outdoor_to_indoor(
+        self, weather_search_mcp
+    ):
+        """When weather is bad, outdoor_seating flips to False and a note is shown."""
+        mcp, db = weather_search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        restaurants = [make_restaurant(name="Rain Place", rating=4.5)]
+        mock_class = _make_places_client_mock(restaurants)
+
+        # Create a mock WeatherInfo with bad weather
+        mock_weather_info = MagicMock()
+        mock_weather_info.outdoor_suitable = False
+        mock_weather_info.description = "heavy rain"
+        mock_weather_info.temperature_f = 45.0
+
+        mock_weather_client = MagicMock()
+        mock_weather_client.get_weather = AsyncMock(return_value=mock_weather_info)
+        mock_weather_class = MagicMock(return_value=mock_weather_client)
+
+        with (
+            patch("src.tools.search.GooglePlacesClient", mock_class),
+            patch("src.clients.weather.WeatherClient", mock_weather_class),
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "search_restaurants",
+                    {"outdoor_seating": True},
+                )
+        text = str(result)
+        assert "Heavy rain" in text
+        assert "indoor options instead" in text
+        # The query should NOT contain "outdoor seating" because it was flipped
+        call_kwargs = mock_class.return_value.search_nearby.call_args
+        assert "outdoor seating" not in call_kwargs.kwargs["query"]
+
+    async def test_good_weather_keeps_outdoor(self, weather_search_mcp):
+        """When weather is good, outdoor_seating stays True."""
+        mcp, db = weather_search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        restaurants = [make_restaurant(name="Sunny Place", rating=4.5)]
+        mock_client = MagicMock()
+        mock_client.search_nearby = AsyncMock(return_value=restaurants)
+        mock_class = MagicMock(return_value=mock_client)
+
+        mock_weather_info = MagicMock()
+        mock_weather_info.outdoor_suitable = True
+
+        mock_weather_client = MagicMock()
+        mock_weather_client.get_weather = AsyncMock(return_value=mock_weather_info)
+        mock_weather_class = MagicMock(return_value=mock_weather_client)
+
+        with (
+            patch("src.tools.search.GooglePlacesClient", mock_class),
+            patch("src.clients.weather.WeatherClient", mock_weather_class),
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "search_restaurants",
+                    {"outdoor_seating": True},
+                )
+        text = str(result)
+        # No weather note should appear
+        assert "indoor options instead" not in text
+        # The query should still contain "outdoor seating"
+        call_kwargs = mock_client.search_nearby.call_args
+        assert "outdoor seating" in call_kwargs.kwargs["query"]
+
+    async def test_weather_check_skipped_when_no_api_key(
+        self, no_key_search_mcp
+    ):
+        """When OPENWEATHER_API_KEY is not set, weather check is skipped entirely."""
+        mcp, db = no_key_search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        restaurants = [make_restaurant(name="Outdoor Spot", rating=4.5)]
+        mock_client = MagicMock()
+        mock_client.search_nearby = AsyncMock(return_value=restaurants)
+        mock_class = MagicMock(return_value=mock_client)
+
+        with patch("src.tools.search.GooglePlacesClient", mock_class):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "search_restaurants",
+                    {"outdoor_seating": True},
+                )
+        text = str(result)
+        # No weather note, and outdoor seating is preserved in query
+        assert "indoor options instead" not in text
+        call_kwargs = mock_client.search_nearby.call_args
+        assert "outdoor seating" in call_kwargs.kwargs["query"]
+
+    async def test_weather_check_exception_is_caught(
+        self, weather_search_mcp
+    ):
+        """If the weather API call raises an exception, it's caught and ignored."""
+        mcp, db = weather_search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        restaurants = [make_restaurant(name="Exception Place", rating=4.5)]
+        mock_client = MagicMock()
+        mock_client.search_nearby = AsyncMock(return_value=restaurants)
+        mock_class = MagicMock(return_value=mock_client)
+
+        mock_weather_client = MagicMock()
+        mock_weather_client.get_weather = AsyncMock(
+            side_effect=RuntimeError("API down")
+        )
+        mock_weather_class = MagicMock(return_value=mock_weather_client)
+
+        with (
+            patch("src.tools.search.GooglePlacesClient", mock_class),
+            patch("src.clients.weather.WeatherClient", mock_weather_class),
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "search_restaurants",
+                    {"outdoor_seating": True},
+                )
+        text = str(result)
+        # Should still work — no crash, no weather note
+        assert "Exception Place" in text
+        assert "indoor options instead" not in text
+        # outdoor_seating stays True since exception was caught
+        call_kwargs = mock_client.search_nearby.call_args
+        assert "outdoor seating" in call_kwargs.kwargs["query"]
+
+
+# ── EPIC-07: Recency penalty tests ──────────────────────────────────────────
+
+
+class TestRecencyPenalty:
+    """Tests for recency-aware sorting and recency notes."""
+
+    async def test_recency_penalty_applied_to_sorting(self, search_mcp):
+        """Recently visited cuisines should be ranked lower."""
+        mcp, db = search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        # Log a recent visit for italian cuisine
+        from datetime import date
+
+        from tests.factories import make_visit
+
+        today = date.today().isoformat()
+        visit = make_visit(
+            restaurant_id="place_recent",
+            restaurant_name="Recent Italian",
+            date=today,
+            cuisine="italian",
+        )
+        await db.log_visit(visit)
+
+        # Create two restaurants with equal rating at same location:
+        # one italian (recently visited), one japanese (not visited)
+        italian_place = make_restaurant(
+            id="place_it",
+            name="Italian Again",
+            rating=4.8,
+            lat=40.7129,
+            lng=-74.0059,
+            cuisine=["italian"],
+        )
+        japanese_place = make_restaurant(
+            id="place_jp",
+            name="Japanese Fresh",
+            rating=4.8,
+            lat=40.7129,
+            lng=-74.0059,
+            cuisine=["japanese"],
+        )
+
+        mock_class = _make_places_client_mock([italian_place, japanese_place])
+
+        with patch("src.tools.search.GooglePlacesClient", mock_class):
+            async with Client(mcp) as client:
+                result = await client.call_tool("search_restaurants", {})
+        text = str(result)
+        # Japanese should appear before Italian due to recency penalty
+        jp_pos = text.index("Japanese Fresh")
+        it_pos = text.index("Italian Again")
+        assert jp_pos < it_pos
+
+    async def test_recency_notes_shown_for_recent_cuisines(self, search_mcp):
+        """Cuisines with penalty >= 0.5 should show recency notes."""
+        mcp, db = search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        # Log a visit today (penalty ~ 1.0, which is >= 0.5)
+        from datetime import date
+
+        from tests.factories import make_visit
+
+        today = date.today().isoformat()
+        visit = make_visit(
+            restaurant_id="place_sushi",
+            restaurant_name="Sushi Spot",
+            date=today,
+            cuisine="sushi",
+        )
+        await db.log_visit(visit)
+
+        sushi_place = make_restaurant(
+            id="place_sushi2",
+            name="Another Sushi",
+            rating=4.5,
+            cuisine=["sushi"],
+        )
+        mock_class = _make_places_client_mock([sushi_place])
+
+        with patch("src.tools.search.GooglePlacesClient", mock_class):
+            async with Client(mcp) as client:
+                result = await client.call_tool("search_restaurants", {})
+        text = str(result)
+        assert "You had sushi" in text
+        assert "days ago" in text
+
+    async def test_no_cuisine_restaurant_in_recency_sort(self, search_mcp):
+        """Restaurant with no cuisine list is handled gracefully in recency sorting."""
+        mcp, db = search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        # A restaurant with no cuisine
+        no_cuisine_place = make_restaurant(
+            id="place_nc",
+            name="No Cuisine Place",
+            rating=4.5,
+            cuisine=[],
+        )
+        mock_class = _make_places_client_mock([no_cuisine_place])
+
+        with patch("src.tools.search.GooglePlacesClient", mock_class):
+            async with Client(mcp) as client:
+                result = await client.call_tool("search_restaurants", {})
+        text = str(result)
+        assert "No Cuisine Place" in text
+
+    async def test_duplicate_recency_notes_deduped(self, search_mcp):
+        """Multiple restaurants with same penalized cuisine produce one note."""
+        mcp, db = search_mcp
+        home = make_location(name="home", lat=40.7128, lng=-74.0060)
+        await db.save_location(home)
+        await db.save_preferences(make_user_preferences(name="Alice"))
+
+        from datetime import date
+
+        from tests.factories import make_visit
+
+        today = date.today().isoformat()
+        visit = make_visit(
+            restaurant_id="place_dup",
+            restaurant_name="Dup Italian",
+            date=today,
+            cuisine="italian",
+        )
+        await db.log_visit(visit)
+
+        # Two italian restaurants — should produce only one recency note
+        it1 = make_restaurant(
+            id="place_it1",
+            name="Italian One",
+            rating=4.5,
+            lat=40.7129,
+            lng=-74.0059,
+            cuisine=["italian"],
+        )
+        it2 = make_restaurant(
+            id="place_it2",
+            name="Italian Two",
+            rating=4.5,
+            lat=40.7129,
+            lng=-74.0059,
+            cuisine=["italian"],
+        )
+        mock_class = _make_places_client_mock([it1, it2])
+
+        with patch("src.tools.search.GooglePlacesClient", mock_class):
+            async with Client(mcp) as client:
+                result = await client.call_tool("search_restaurants", {})
+        text = str(result)
+        # The note should exist (dedup branch was exercised)
+        assert "You had italian" in text
+        # Verify both restaurants still appear
+        assert "Italian One" in text
+        assert "Italian Two" in text

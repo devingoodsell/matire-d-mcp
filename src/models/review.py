@@ -12,6 +12,7 @@ class Visit(BaseModel):
     date: str
     party_size: int
     companions: list[str] = []
+    cuisine: str | None = None
     source: str = "booked"
 
 

@@ -759,3 +759,346 @@ class TestAPILogging:
         costs = await db.get_api_costs(days=30)
         assert costs["google"] == 5.0
         assert costs["resy"] == 1.5
+
+
+# ── EPIC-07: get_visit_by_restaurant_name ────────────────────────────────────
+
+
+class TestGetVisitByRestaurantName:
+    async def test_found_exact_match(self, db: DatabaseManager):
+        visit = make_visit(
+            restaurant_id="place_1",
+            restaurant_name="Carbone",
+            date="2026-02-01",
+        )
+        await db.log_visit(visit)
+        result = await db.get_visit_by_restaurant_name("Carbone")
+        assert result is not None
+        assert result.restaurant_name == "Carbone"
+        assert result.restaurant_id == "place_1"
+
+    async def test_not_found(self, db: DatabaseManager):
+        result = await db.get_visit_by_restaurant_name("Nonexistent Place")
+        assert result is None
+
+    async def test_partial_match(self, db: DatabaseManager):
+        visit = make_visit(
+            restaurant_id="place_2",
+            restaurant_name="Luigi's Italian Kitchen",
+            date="2026-02-05",
+        )
+        await db.log_visit(visit)
+        result = await db.get_visit_by_restaurant_name("Luigi")
+        assert result is not None
+        assert result.restaurant_name == "Luigi's Italian Kitchen"
+
+    async def test_returns_most_recent_visit(self, db: DatabaseManager):
+        v1 = make_visit(
+            restaurant_id="place_3",
+            restaurant_name="Sushi Nakazawa",
+            date="2026-01-10",
+        )
+        v2 = make_visit(
+            restaurant_id="place_3",
+            restaurant_name="Sushi Nakazawa",
+            date="2026-02-01",
+        )
+        await db.log_visit(v1)
+        await db.log_visit(v2)
+        result = await db.get_visit_by_restaurant_name("Sushi Nakazawa")
+        assert result is not None
+        assert result.date == "2026-02-01"
+
+    async def test_case_insensitive(self, db: DatabaseManager):
+        visit = make_visit(
+            restaurant_id="place_4",
+            restaurant_name="Le Bernardin",
+            date="2026-02-01",
+        )
+        await db.log_visit(visit)
+        result = await db.get_visit_by_restaurant_name("le bernardin")
+        assert result is not None
+        assert result.restaurant_name == "Le Bernardin"
+
+
+# ── EPIC-07: get_visit_review ────────────────────────────────────────────────
+
+
+class TestGetVisitReview:
+    async def test_found(self, db: DatabaseManager):
+        visit = make_visit(restaurant_id="place_1", restaurant_name="R1")
+        visit_id = await db.log_visit(visit)
+        review = make_visit_review(
+            visit_id=visit_id,
+            would_return=True,
+            overall_rating=4,
+            notes="Great meal",
+        )
+        await db.save_visit_review(review)
+        result = await db.get_visit_review(visit_id)
+        assert result is not None
+        assert result.visit_id == visit_id
+        assert result.would_return is True
+        assert result.overall_rating == 4
+        assert result.notes == "Great meal"
+
+    async def test_not_found(self, db: DatabaseManager):
+        result = await db.get_visit_review(9999)
+        assert result is None
+
+
+# ── EPIC-07: get_restaurant_reviews ──────────────────────────────────────────
+
+
+class TestGetRestaurantReviews:
+    async def test_with_reviews(self, db: DatabaseManager):
+        v1 = make_visit(
+            restaurant_id="place_r1",
+            restaurant_name="Test Restaurant",
+            date="2026-01-10",
+        )
+        v2 = make_visit(
+            restaurant_id="place_r1",
+            restaurant_name="Test Restaurant",
+            date="2026-02-01",
+        )
+        v1_id = await db.log_visit(v1)
+        v2_id = await db.log_visit(v2)
+        await db.save_visit_review(
+            make_visit_review(visit_id=v1_id, would_return=True, overall_rating=4)
+        )
+        await db.save_visit_review(
+            make_visit_review(visit_id=v2_id, would_return=False, overall_rating=2)
+        )
+        reviews = await db.get_restaurant_reviews("place_r1")
+        assert len(reviews) == 2
+        ratings = {r.overall_rating for r in reviews}
+        assert ratings == {4, 2}
+
+    async def test_empty(self, db: DatabaseManager):
+        reviews = await db.get_restaurant_reviews("nonexistent")
+        assert reviews == []
+
+    async def test_only_returns_reviews_for_target_restaurant(
+        self, db: DatabaseManager
+    ):
+        v1 = make_visit(
+            restaurant_id="place_target",
+            restaurant_name="Target",
+            date="2026-02-01",
+        )
+        v2 = make_visit(
+            restaurant_id="place_other",
+            restaurant_name="Other",
+            date="2026-02-01",
+        )
+        v1_id = await db.log_visit(v1)
+        v2_id = await db.log_visit(v2)
+        await db.save_visit_review(
+            make_visit_review(visit_id=v1_id, would_return=True, overall_rating=5)
+        )
+        await db.save_visit_review(
+            make_visit_review(visit_id=v2_id, would_return=True, overall_rating=3)
+        )
+        reviews = await db.get_restaurant_reviews("place_target")
+        assert len(reviews) == 1
+        assert reviews[0].overall_rating == 5
+
+
+# ── EPIC-07: get_recency_penalties ───────────────────────────────────────────
+
+
+class TestGetRecencyPenalties:
+    async def test_with_visits(self, db: DatabaseManager):
+        today = date.today().isoformat()
+        visit = make_visit(
+            restaurant_id="place_it",
+            restaurant_name="Italian Spot",
+            date=today,
+            cuisine="italian",
+        )
+        await db.log_visit(visit)
+        penalties = await db.get_recency_penalties(days=14)
+        assert "italian" in penalties
+        # Visited today: days_ago ~ 0, penalty ~ 1.0
+        assert penalties["italian"] > 0.8
+
+    async def test_empty(self, db: DatabaseManager):
+        penalties = await db.get_recency_penalties(days=14)
+        assert penalties == {}
+
+    async def test_mixed_cuisines(self, db: DatabaseManager):
+        today = date.today().isoformat()
+        v1 = make_visit(
+            restaurant_id="place_it",
+            restaurant_name="Italian Spot",
+            date=today,
+            cuisine="italian",
+        )
+        v2 = make_visit(
+            restaurant_id="place_jp",
+            restaurant_name="Japanese Spot",
+            date=today,
+            cuisine="japanese",
+        )
+        await db.log_visit(v1)
+        await db.log_visit(v2)
+        penalties = await db.get_recency_penalties(days=14)
+        assert "italian" in penalties
+        assert "japanese" in penalties
+        assert penalties["italian"] > 0.8
+        assert penalties["japanese"] > 0.8
+
+    async def test_cuisine_is_lowercased(self, db: DatabaseManager):
+        today = date.today().isoformat()
+        visit = make_visit(
+            restaurant_id="place_mixed",
+            restaurant_name="Mixed Case",
+            date=today,
+            cuisine="Italian",
+        )
+        await db.log_visit(visit)
+        penalties = await db.get_recency_penalties(days=14)
+        assert "italian" in penalties
+        assert "Italian" not in penalties
+
+    async def test_falls_back_to_cached_cuisine(self, db: DatabaseManager):
+        """When visit has no cuisine, falls back to restaurant_cache cuisine."""
+        today = date.today().isoformat()
+        restaurant = make_restaurant(
+            id="place_cached",
+            name="Cached Cuisine Place",
+            cuisine=["mexican"],
+        )
+        await db.cache_restaurant(restaurant)
+        visit = make_visit(
+            restaurant_id="place_cached",
+            restaurant_name="Cached Cuisine Place",
+            date=today,
+            cuisine=None,
+        )
+        await db.log_visit(visit)
+        penalties = await db.get_recency_penalties(days=14)
+        assert "mexican" in penalties
+
+    async def test_no_cuisine_anywhere_skipped(self, db: DatabaseManager):
+        """Visit with no cuisine and no cached restaurant cuisine is skipped."""
+        today = date.today().isoformat()
+        # Visit with no cuisine and no matching cache entry
+        visit = make_visit(
+            restaurant_id="place_unknown",
+            restaurant_name="Mystery Place",
+            date=today,
+            cuisine=None,
+        )
+        await db.log_visit(visit)
+        penalties = await db.get_recency_penalties(days=14)
+        assert penalties == {}
+
+    async def test_cached_restaurant_empty_cuisine_list_skipped(
+        self, db: DatabaseManager
+    ):
+        """Visit with empty cached cuisine list is also skipped."""
+        today = date.today().isoformat()
+        restaurant = make_restaurant(
+            id="place_empty_c",
+            name="Empty Cuisine",
+            cuisine=[],
+        )
+        await db.cache_restaurant(restaurant)
+        visit = make_visit(
+            restaurant_id="place_empty_c",
+            restaurant_name="Empty Cuisine",
+            date=today,
+            cuisine=None,
+        )
+        await db.log_visit(visit)
+        penalties = await db.get_recency_penalties(days=14)
+        assert penalties == {}
+
+    async def test_keeps_highest_penalty_for_same_cuisine(
+        self, db: DatabaseManager
+    ):
+        """When same cuisine visited multiple times, highest penalty wins."""
+        today = date.today().isoformat()
+        # Recent visit (high penalty)
+        v1 = make_visit(
+            restaurant_id="place_it1",
+            restaurant_name="Italian Today",
+            date=today,
+            cuisine="italian",
+        )
+        # Older visit (lower penalty) — 7 days ago
+        seven_days_ago = (
+            date.today() - __import__("datetime").timedelta(days=7)
+        ).isoformat()
+        v2 = make_visit(
+            restaurant_id="place_it2",
+            restaurant_name="Italian Last Week",
+            date=seven_days_ago,
+            cuisine="italian",
+        )
+        await db.log_visit(v1)
+        await db.log_visit(v2)
+        penalties = await db.get_recency_penalties(days=14)
+        assert "italian" in penalties
+        # Should keep the higher penalty (~1.0 from today, not ~0.5 from 7 days ago)
+        assert penalties["italian"] > 0.8
+
+
+# ── EPIC-07: Visit model cuisine field ───────────────────────────────────────
+
+
+class TestVisitCuisineField:
+    async def test_log_visit_stores_cuisine(self, db: DatabaseManager):
+        visit = make_visit(
+            restaurant_id="place_cuisine",
+            restaurant_name="Cuisine Test",
+            cuisine="thai",
+        )
+        visit_id = await db.log_visit(visit)
+        row = await db.fetch_one(
+            "SELECT cuisine FROM visits WHERE id = ?", (visit_id,)
+        )
+        assert row is not None
+        assert row["cuisine"] == "thai"
+
+    async def test_log_visit_stores_null_cuisine(self, db: DatabaseManager):
+        visit = make_visit(
+            restaurant_id="place_no_cuisine",
+            restaurant_name="No Cuisine",
+            cuisine=None,
+        )
+        visit_id = await db.log_visit(visit)
+        row = await db.fetch_one(
+            "SELECT cuisine FROM visits WHERE id = ?", (visit_id,)
+        )
+        assert row is not None
+        assert row["cuisine"] is None
+
+    async def test_log_visit_cuisine_roundtrips(self, db: DatabaseManager):
+        """Cuisine stored via log_visit is returned via get_recent_visits."""
+        today = date.today().isoformat()
+        visit = make_visit(
+            restaurant_id="place_rt",
+            restaurant_name="Roundtrip",
+            date=today,
+            cuisine="korean",
+        )
+        await db.log_visit(visit)
+        visits = await db.get_recent_visits(days=14)
+        assert len(visits) == 1
+        assert visits[0].cuisine == "korean"
+
+    async def test_get_visits_for_restaurant_includes_cuisine(
+        self, db: DatabaseManager
+    ):
+        visit = make_visit(
+            restaurant_id="place_vc",
+            restaurant_name="Visit Cuisine",
+            cuisine="french",
+        )
+        await db.log_visit(visit)
+        visits = await db.get_visits_for_restaurant("place_vc")
+        assert len(visits) == 1
+        assert visits[0].cuisine == "french"

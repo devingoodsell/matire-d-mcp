@@ -90,6 +90,7 @@ CREATE TABLE IF NOT EXISTS visits (
     date TEXT NOT NULL,
     party_size INTEGER DEFAULT 2,
     companions TEXT,
+    cuisine TEXT,
     source TEXT DEFAULT 'booked',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
