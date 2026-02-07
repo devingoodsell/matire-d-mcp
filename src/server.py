@@ -101,6 +101,7 @@ def initialize() -> FastMCP:
 
     # Register tools
     from src.tools.blacklist import register_blacklist_tools
+    from src.tools.booking import register_booking_tools
     from src.tools.groups import register_group_tools
     from src.tools.people import register_people_tools
     from src.tools.preferences import register_preference_tools
@@ -111,6 +112,7 @@ def initialize() -> FastMCP:
     register_people_tools(mcp)
     register_group_tools(mcp)
     register_blacklist_tools(mcp)
+    register_booking_tools(mcp)
 
     logger.info("Restaurant MCP server initialized")
     return mcp
