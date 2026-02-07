@@ -3,6 +3,8 @@
 import logging
 import re
 
+import httpx
+
 from src.clients.resy import ResyClient
 from src.models.restaurant import Restaurant
 from src.storage.database import DatabaseManager
@@ -29,15 +31,40 @@ def _extract_street_number(address: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _slugify(name: str) -> str:
+    """Convert a restaurant name to a URL-safe slug."""
+    slug = name.lower().strip()
+    slug = re.sub(r"[^a-z0-9\s-]", "", slug)
+    slug = re.sub(r"\s+", "-", slug)
+    return slug
+
+
+def generate_resy_deep_link(
+    venue_id: str, date: str, party_size: int
+) -> str:
+    """Generate a Resy booking deep link."""
+    return f"https://resy.com/cities/ny/{venue_id}?date={date}&seats={party_size}"
+
+
+def generate_opentable_deep_link(
+    slug: str, date: str, time: str, party_size: int
+) -> str:
+    """Generate an OpenTable booking deep link."""
+    return (
+        f"https://www.opentable.com/r/{slug}"
+        f"?date={date}&time={time}&party_size={party_size}"
+    )
+
+
 class VenueMatcher:
-    """Match Google Place restaurants to Resy venue IDs.
+    """Match Google Place restaurants to Resy venue IDs and OpenTable slugs.
 
     Args:
         db: DatabaseManager for cache lookups.
         resy_client: Authenticated ResyClient for venue search.
     """
 
-    def __init__(self, db: DatabaseManager, resy_client: ResyClient) -> None:
+    def __init__(self, db: DatabaseManager, resy_client: ResyClient | None = None) -> None:
         self.db = db
         self.resy_client = resy_client
 
@@ -53,6 +80,9 @@ class VenueMatcher:
         Returns:
             Resy venue_id string, or None if not on Resy.
         """
+        if not self.resy_client:
+            return None
+
         # 1. Cache check
         cached = await self.db.get_cached_restaurant(restaurant.id)
         if cached and cached.resy_venue_id:
@@ -89,5 +119,44 @@ class VenueMatcher:
                     restaurant.id, resy_id=venue_id, opentable_id=None
                 )
                 return venue_id
+
+        return None
+
+    async def find_opentable_slug(self, restaurant: Restaurant) -> str | None:
+        """Find the OpenTable slug for a restaurant.
+
+        Strategy:
+        1. Check cache for existing opentable_id
+        2. Try common slug patterns with HEAD request
+        3. Cache the result
+
+        Returns:
+            OpenTable slug string, or None if not on OpenTable.
+        """
+        # 1. Cache check
+        cached = await self.db.get_cached_restaurant(restaurant.id)
+        if cached and cached.opentable_id:
+            return cached.opentable_id
+
+        # 2. Try slug patterns
+        base_slug = _slugify(restaurant.name)
+        candidates = [
+            f"{base_slug}-new-york",
+            base_slug,
+        ]
+
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            for slug in candidates:
+                url = f"https://www.opentable.com/r/{slug}"
+                try:
+                    response = await client.head(url)
+                    if response.status_code == 200:
+                        # 3. Cache result
+                        await self.db.update_platform_ids(
+                            restaurant.id, resy_id=None, opentable_id=slug
+                        )
+                        return slug
+                except httpx.HTTPError:
+                    continue
 
         return None
