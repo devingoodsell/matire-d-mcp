@@ -251,6 +251,28 @@ class TestParseSlots:
         assert slots[0].config_id == "abc"
         assert slots[0].platform == BookingPlatform.RESY
 
+    def test_slot_time_with_seconds_normalized_to_hh_mm(self):
+        """Resy API may return seconds — they must be stripped to HH:MM."""
+        data = {
+            "results": {
+                "venues": [
+                    {
+                        "slots": [
+                            {
+                                "config": {"type": "Indoor", "token": "t1"},
+                                "date": {"start": "2026-02-13 18:30:00"},
+                            }
+                        ]
+                    }
+                ]
+            }
+        }
+        rc = ResyClient()
+        slots = rc._parse_slots(data)
+
+        assert len(slots) == 1
+        assert slots[0].time == "18:30"
+
     def test_slot_with_empty_config_and_date(self):
         data = {
             "results": {
@@ -419,7 +441,7 @@ class TestSearchVenue:
         resp = _mock_response(json_data=json_data)
         mock_async_client.return_value = _mock_client(resp)
 
-        result = await ResyClient(auth_token="t").search_venue("steak", 40.7, -74.0)
+        result = await ResyClient(auth_token="t").search_venue("steak")
 
         assert len(result) == 2
         assert result[0] == {
@@ -430,11 +452,25 @@ class TestSearchVenue:
         assert result[1]["id"] == "99"
 
     @patch("src.clients.resy.httpx.AsyncClient")
+    async def test_uses_post_with_json_body(self, mock_async_client):
+        """search_venue sends POST with JSON body to /3/venuesearch/search."""
+        resp = _mock_response(json_data={"search": {"hits": []}})
+        client = _mock_client(resp)
+        mock_async_client.return_value = client
+
+        await ResyClient(auth_token="t").search_venue("Carbone")
+
+        client.post.assert_awaited_once()
+        call_args = client.post.call_args
+        assert "/3/venuesearch/search" in call_args.args[0]
+        assert call_args.kwargs["json"] == {"query": "Carbone"}
+
+    @patch("src.clients.resy.httpx.AsyncClient")
     async def test_empty_hits(self, mock_async_client):
         resp = _mock_response(json_data={"search": {"hits": []}})
         mock_async_client.return_value = _mock_client(resp)
 
-        result = await ResyClient().search_venue("nonexistent", 0.0, 0.0)
+        result = await ResyClient().search_venue("nonexistent")
         assert result == []
 
     @patch("src.clients.resy.httpx.AsyncClient")
@@ -442,5 +478,55 @@ class TestSearchVenue:
         resp = _mock_response(status_code=500, text="Internal Server Error")
         mock_async_client.return_value = _mock_client(resp)
 
-        result = await ResyClient().search_venue("test", 0.0, 0.0)
+        result = await ResyClient().search_venue("test")
         assert result == []
+
+
+# ---------------------------------------------------------------------------
+# ResyClient._parse_venue_hit
+# ---------------------------------------------------------------------------
+
+class TestParseVenueHit:
+    """_parse_venue_hit normalises different response formats."""
+
+    def test_nested_id_resy(self):
+        """Old-style response with id.resy nested dict."""
+        hit = {"id": {"resy": 42}, "name": "Carbone", "location": {"city": "NY"}}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "42", "name": "Carbone", "location": {"city": "NY"}}
+
+    def test_object_id_field(self):
+        """Algolia-style response with objectID."""
+        hit = {"objectID": "12345", "name": "Le Bernardin", "location": {}}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "12345", "name": "Le Bernardin", "location": {}}
+
+    def test_plain_string_id(self):
+        """Simple string id field."""
+        hit = {"id": "999", "name": "Test", "location": {}}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "999", "name": "Test", "location": {}}
+
+    def test_missing_id_fields(self):
+        """No id, objectID, or nested id — returns empty string."""
+        hit = {"name": "Mystery", "location": {}}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "", "name": "Mystery", "location": {}}
+
+    def test_empty_nested_id(self):
+        """Nested id dict but no resy key."""
+        hit = {"id": {}, "name": "X", "location": {}}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "", "name": "X", "location": {}}
+
+    def test_null_resy_id_returns_empty_string(self):
+        """Nested id.resy is None — should return '' not 'None'."""
+        hit = {"id": {"resy": None}, "name": "X", "location": {}}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "", "name": "X", "location": {}}
+
+    def test_missing_name_and_location(self):
+        """Missing name/location fields default to empty."""
+        hit = {"objectID": "1"}
+        result = ResyClient._parse_venue_hit(hit)
+        assert result == {"id": "1", "name": "", "location": {}}

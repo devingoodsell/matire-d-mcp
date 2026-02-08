@@ -7,9 +7,12 @@ from fastmcp import Client, FastMCP
 
 from src.models.enums import BookingPlatform
 from src.models.restaurant import TimeSlot
+from src.server import resolve_credential
 from src.storage.database import DatabaseManager
 from src.tools.booking import (
     _book_via_resy,
+    _ensure_opentable_credentials,
+    _ensure_resy_credentials,
     _format_time,
     _get_auth_manager,
     _get_credential_store,
@@ -44,10 +47,12 @@ def booking_mcp(db):
     db_patch = patch("src.tools.booking.get_db", return_value=db)
     store_patch = patch("src.tools.booking._get_credential_store")
     auth_patch = patch("src.tools.booking._get_auth_manager")
+    config_store_patch = patch("src.server._config_store", None)
 
     db_patch.start()
     mock_store_fn = store_patch.start()
     mock_auth_fn = auth_patch.start()
+    config_store_patch.start()
 
     # Default credential store — Resy creds present
     mock_cred_store = MagicMock()
@@ -77,6 +82,7 @@ def booking_mcp(db):
     db_patch.stop()
     store_patch.stop()
     auth_patch.stop()
+    config_store_patch.stop()
 
 
 def _make_slot(
@@ -272,6 +278,70 @@ class TestStoreResyCredentials:
         assert "Login failed" in text
         assert "network down" in text
 
+    async def test_env_vars_used_when_no_params(self, booking_mcp, monkeypatch):
+        """When no args passed, env var credentials are used."""
+        mcp, _db, mock_cred_store, mock_auth = booking_mcp
+        mock_auth.authenticate.return_value = {
+            "auth_token": "tok", "api_key": "key", "payment_methods": [],
+        }
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "env@test.com"
+        mock_settings.resy_password = "env-pw"
+        with patch("src.config.get_settings", return_value=mock_settings):
+            async with Client(mcp) as client:
+                result = await client.call_tool("store_resy_credentials", {})
+        text = str(result)
+        assert "Credentials saved and verified" in text
+        mock_auth.authenticate.assert_awaited_once_with("env@test.com", "env-pw")
+
+    async def test_params_override_env_vars(self, booking_mcp, monkeypatch):
+        """Explicit params take priority over env vars."""
+        mcp, _db, mock_cred_store, mock_auth = booking_mcp
+        mock_auth.authenticate.return_value = {
+            "auth_token": "tok", "api_key": "key", "payment_methods": [],
+        }
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "env@test.com"
+        mock_settings.resy_password = "env-pw"
+        with patch("src.config.get_settings", return_value=mock_settings):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "store_resy_credentials",
+                    {"email": "explicit@test.com", "password": "explicit-pw"},
+                )
+        text = str(result)
+        assert "Credentials saved and verified" in text
+        mock_auth.authenticate.assert_awaited_once_with("explicit@test.com", "explicit-pw")
+
+    async def test_missing_both_returns_error(self, booking_mcp):
+        """When no params and no env vars, returns instructional error."""
+        mcp, _db, _store, _auth = booking_mcp
+        mock_settings = MagicMock()
+        mock_settings.resy_email = None
+        mock_settings.resy_password = None
+        with patch("src.config.get_settings", return_value=mock_settings):
+            async with Client(mcp) as client:
+                result = await client.call_tool("store_resy_credentials", {})
+        text = str(result)
+        assert "Missing credentials" in text
+        assert "RESY_EMAIL" in text
+
+    async def test_password_not_in_saved_blob(self, booking_mcp):
+        """Resy creds blob should NOT contain the password."""
+        mcp, _db, mock_cred_store, mock_auth = booking_mcp
+        mock_auth.authenticate.return_value = {
+            "auth_token": "tok", "api_key": "key", "payment_methods": [],
+        }
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "store_resy_credentials",
+                {"email": "a@b.com", "password": "secret"},
+            )
+        saved = mock_cred_store.save_credentials.call_args[0][1]
+        assert "password" not in saved
+        assert saved["email"] == "a@b.com"
+        assert saved["auth_token"] == "tok"
+
 
 # ── store_opentable_credentials ────────────────────────────────────────────
 
@@ -344,6 +414,74 @@ class TestStoreOpenTableCredentials:
                     {"email": "u@ot.com", "password": "p"},
                 )
         mock_ot_client.close.assert_awaited_once()
+
+    async def test_env_vars_used_when_no_params(self, booking_mcp):
+        """When no args passed, env var credentials are used."""
+        mcp, _db, mock_cred_store, _auth = booking_mcp
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client._login = AsyncMock()
+        mock_ot_client.close = AsyncMock()
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_email = "ot-env@test.com"
+        mock_settings.opentable_password = "ot-env-pw"
+        with (
+            patch("src.config.get_settings", return_value=mock_settings),
+            patch(
+                "src.clients.opentable.OpenTableClient",
+                return_value=mock_ot_client,
+            ),
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool("store_opentable_credentials", {})
+        text = str(result)
+        assert "OpenTable credentials saved and verified" in text
+        mock_cred_store.save_credentials.assert_called_once_with(
+            "opentable", {"email": "ot-env@test.com", "password": "ot-env-pw"},
+        )
+
+    async def test_params_override_env_vars(self, booking_mcp):
+        """Explicit params take priority over env vars."""
+        mcp, _db, mock_cred_store, _auth = booking_mcp
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client._login = AsyncMock()
+        mock_ot_client.close = AsyncMock()
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_email = "ot-env@test.com"
+        mock_settings.opentable_password = "ot-env-pw"
+        with (
+            patch("src.config.get_settings", return_value=mock_settings),
+            patch(
+                "src.clients.opentable.OpenTableClient",
+                return_value=mock_ot_client,
+            ),
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "store_opentable_credentials",
+                    {"email": "explicit@ot.com", "password": "explicit-pw"},
+                )
+        text = str(result)
+        assert "OpenTable credentials saved and verified" in text
+        mock_cred_store.save_credentials.assert_called_once_with(
+            "opentable", {"email": "explicit@ot.com", "password": "explicit-pw"},
+        )
+
+    async def test_missing_both_returns_error(self, booking_mcp):
+        """When no params and no env vars, returns instructional error."""
+        mcp, _db, _store, _auth = booking_mcp
+        mock_settings = MagicMock()
+        mock_settings.opentable_email = None
+        mock_settings.opentable_password = None
+        with patch("src.config.get_settings", return_value=mock_settings):
+            async with Client(mcp) as client:
+                result = await client.call_tool("store_opentable_credentials", {})
+        text = str(result)
+        assert "Missing credentials" in text
+        assert "OPENTABLE_EMAIL" in text
 
 
 # ── check_availability ─────────────────────────────────────────────────────
@@ -699,6 +837,65 @@ class TestCheckAvailability:
         text = str(result)
         assert "No availability" in text
 
+    async def test_negative_cached_resy_skips_matcher(self, booking_mcp):
+        """resy_venue_id="" (negative cache) skips VenueMatcher entirely."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="", opentable_id=None,
+        )
+        await db.cache_restaurant(restaurant)
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            matcher_inst = AsyncMock()
+            mock_matcher_cls.return_value = matcher_inst
+            matcher_inst.find_opentable_slug.return_value = None
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "check_availability",
+                    {"restaurant_name": "Carbone", "date": "2026-02-14"},
+                )
+            # VenueMatcher.find_resy_venue should NOT be called
+            matcher_inst.find_resy_venue.assert_not_called()
+            resy_inst.find_availability.assert_not_called()
+        text = str(result)
+        assert "No availability" in text
+
+    async def test_negative_cached_opentable_skips_matcher(self, booking_mcp):
+        """opentable_id="" (negative cache) skips VenueMatcher entirely."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="rv1", opentable_id="",
+        )
+        await db.cache_restaurant(restaurant)
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            resy_inst.find_availability.return_value = [_make_slot("19:00")]
+            matcher_inst = AsyncMock()
+            mock_matcher_cls.return_value = matcher_inst
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "check_availability",
+                    {"restaurant_name": "Carbone", "date": "2026-02-14"},
+                )
+            # VenueMatcher.find_opentable_slug should NOT be called
+            matcher_inst.find_opentable_slug.assert_not_called()
+        text = str(result)
+        # Should still show Resy slots
+        assert "7:00 PM" in text
+        assert "Resy" in text
+
     async def test_no_venue_id_found_by_resy_matcher_skips_resy_slots(self, booking_mcp):
         """When matcher returns None for resy venue, resy slots are skipped."""
         mcp, db, _store, _auth = booking_mcp
@@ -875,7 +1072,9 @@ class TestMakeReservation:
     async def test_opentable_booking_succeeds(self, booking_mcp):
         """When no Resy creds, OpenTable booking succeeds directly."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.return_value = None
+        mock_cred_store.get_credentials.side_effect = lambda p: (
+            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
+        )
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
         )
@@ -913,7 +1112,9 @@ class TestMakeReservation:
     async def test_opentable_booking_error_falls_through_to_deep_links(self, booking_mcp):
         """OpenTable book returns error — falls through to deep link fallback."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.return_value = None
+        mock_cred_store.get_credentials.side_effect = lambda p: (
+            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
+        )
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
         )
@@ -979,6 +1180,7 @@ class TestMakeReservation:
         text = str(result)
         assert "Could not complete booking automatically" in text
         assert "resy.com" in text
+        assert "resy.com/cities/ny/rv1" in text
         assert "opentable.com" in text
 
     async def test_deep_link_with_only_venue_id(self, booking_mcp):
@@ -995,8 +1197,17 @@ class TestMakeReservation:
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
-            # No matching time slot
-            resy_inst.find_availability.return_value = []
+            # Slots exist but none match the requested 19:00
+            resy_inst.find_availability.return_value = [
+                TimeSlot(
+                    time="17:30", type="Dining Room",
+                    platform=BookingPlatform.RESY, config_id="t1",
+                ),
+                TimeSlot(
+                    time="20:00", type="Dining Room",
+                    platform=BookingPlatform.RESY, config_id="t2",
+                ),
+            ]
             matcher_inst = AsyncMock()
             mock_matcher_cls.return_value = matcher_inst
             matcher_inst.find_opentable_slug.return_value = None
@@ -1014,12 +1225,19 @@ class TestMakeReservation:
         text = str(result)
         assert "Could not complete booking automatically" in text
         assert "resy.com" in text
+        assert "resy.com/cities/ny/rv1" in text
         assert "opentable.com" not in text
+        # Available times shown in fallback
+        assert "7:00 PM is not available on Resy" in text
+        assert "5:30 PM" in text
+        assert "8:00 PM" in text
 
     async def test_deep_link_with_only_ot_slug(self, booking_mcp):
         """Only ot_slug exists, no resy venue_id — only OpenTable deep link."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.return_value = None
+        mock_cred_store.get_credentials.side_effect = lambda p: (
+            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
+        )
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
         )
@@ -1048,6 +1266,86 @@ class TestMakeReservation:
         assert "opentable.com" in text
         assert "resy.com" not in text
 
+    async def test_negative_cached_resy_skips_matcher_in_booking(self, booking_mcp):
+        """resy_venue_id="" (negative cache) skips VenueMatcher for Resy."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="", opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.book.return_value = {"confirmation_number": "OT-NEG"}
+        mock_ot_client.close = AsyncMock()
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
+            patch(
+                "src.clients.opentable.OpenTableClient",
+                return_value=mock_ot_client,
+            ),
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            matcher_inst = AsyncMock()
+            mock_matcher_cls.return_value = matcher_inst
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+            # "" means already checked — no matcher call for Resy
+            matcher_inst.find_resy_venue.assert_not_called()
+            resy_inst.find_availability.assert_not_called()
+        text = str(result)
+        assert "Booked!" in text
+        assert "OT-NEG" in text
+
+    async def test_negative_cached_opentable_skips_matcher_in_booking(self, booking_mcp):
+        """opentable_id="" (negative cache) skips VenueMatcher for OpenTable."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="rv1", opentable_id="",
+        )
+        await db.cache_restaurant(restaurant)
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            resy_inst.find_availability.return_value = [_make_slot("19:00")]
+            resy_inst.get_booking_details.return_value = {
+                "book_token": {"value": "bt-xyz"},
+            }
+            resy_inst.book.return_value = {"resy_token": "RES-NEG"}
+            matcher_inst = AsyncMock()
+            mock_matcher_cls.return_value = matcher_inst
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+            # "" means already checked — no matcher call for OpenTable
+            matcher_inst.find_opentable_slug.assert_not_called()
+        text = str(result)
+        assert "Booked!" in text
+        assert "RES-NEG" in text
+
     async def test_neither_platform_available(self, booking_mcp):
         """No venue_id and no ot_slug — 'doesn't appear to be on Resy or OpenTable'."""
         mcp, db, mock_cred_store, _auth = booking_mcp
@@ -1073,6 +1371,66 @@ class TestMakeReservation:
                 )
         text = str(result)
         assert "doesn't appear to be on Resy or OpenTable" in text
+
+    async def test_deep_link_fallback_includes_website(self, booking_mcp):
+        """Deep link fallback includes restaurant.website when available."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="rv1", opentable_id=None,
+            website="https://carbonenewyork.com",
+        )
+        await db.cache_restaurant(restaurant)
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            resy_inst.find_availability.return_value = []
+            matcher_inst = AsyncMock()
+            mock_matcher_cls.return_value = matcher_inst
+            matcher_inst.find_opentable_slug.return_value = None
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        assert "carbonenewyork.com" in text
+
+    async def test_neither_platform_with_website(self, booking_mcp):
+        """No platforms but has website — includes website link."""
+        mcp, db, mock_cred_store, _auth = booking_mcp
+        mock_cred_store.get_credentials.return_value = None
+        restaurant = make_restaurant(
+            name="Local Spot", resy_venue_id=None, opentable_id=None,
+            website="https://localspot.com",
+        )
+        await db.cache_restaurant(restaurant)
+
+        with patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls:
+            matcher_inst = AsyncMock()
+            mock_matcher_cls.return_value = matcher_inst
+            matcher_inst.find_opentable_slug.return_value = None
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Local Spot",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                    },
+                )
+        text = str(result)
+        assert "localspot.com" in text
 
     async def test_resy_auth_fails_tries_opentable(self, booking_mcp):
         """Resy auth error is caught — tries OpenTable next."""
@@ -1111,7 +1469,9 @@ class TestMakeReservation:
     async def test_no_resy_creds_tries_opentable_directly(self, booking_mcp):
         """When no Resy creds, jumps straight to OpenTable attempt."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.return_value = None
+        mock_cred_store.get_credentials.side_effect = lambda p: (
+            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
+        )
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
         )
@@ -1142,6 +1502,42 @@ class TestMakeReservation:
         text = str(result)
         assert "Booked!" in text
         assert "OT-DIRECT" in text
+
+    async def test_opentable_auth_error_falls_through_to_deep_links(self, booking_mcp):
+        """OpenTable AuthError during login is caught — falls through to deep links."""
+        from src.clients.resy_auth import AuthError
+
+        mcp, db, mock_cred_store, _auth = booking_mcp
+        mock_cred_store.get_credentials.side_effect = lambda p: (
+            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
+        )
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.book.side_effect = AuthError("OpenTable login failed: net::ERR")
+        mock_ot_client.close = AsyncMock()
+
+        with patch(
+            "src.clients.opentable.OpenTableClient",
+            return_value=mock_ot_client,
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        assert "Could not complete booking automatically" in text
+        assert "opentable.com" in text
+        mock_ot_client.close.assert_awaited_once()
 
     async def test_venue_matcher_used_when_no_resy_venue_id(self, booking_mcp):
         """When restaurant has no resy_venue_id, VenueMatcher is called."""
@@ -1232,7 +1628,7 @@ class TestMakeReservation:
 
 class TestBookViaResy:
     async def test_no_matching_slot_returns_none(self, db):
-        """When no slot matches the requested time, returns None."""
+        """When no slot matches the requested time, returns (None, available)."""
         resy_client = AsyncMock()
         resy_client.find_availability.return_value = [
             _make_slot("18:00"),
@@ -1240,27 +1636,28 @@ class TestBookViaResy:
         ]
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, {},
         )
         assert result is None
+        assert available == ["18:00", "20:00"]
 
     async def test_no_book_token_returns_none(self, db):
-        """When booking details have no book_token, returns None."""
+        """When booking details have no book_token, returns (None, available)."""
         resy_client = AsyncMock()
         resy_client.find_availability.return_value = [_make_slot("19:00")]
         resy_client.get_booking_details.return_value = {}
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, {},
         )
         assert result is None
 
     async def test_empty_book_token_value_returns_none(self, db):
-        """When book_token.value is empty, returns None."""
+        """When book_token.value is empty, returns (None, available)."""
         resy_client = AsyncMock()
         resy_client.find_availability.return_value = [_make_slot("19:00")]
         resy_client.get_booking_details.return_value = {
@@ -1268,14 +1665,14 @@ class TestBookViaResy:
         }
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, {},
         )
         assert result is None
 
     async def test_book_returns_error_returns_none(self, db):
-        """When book() returns an error dict, returns None."""
+        """When book() returns an error dict, returns (None, available)."""
         resy_client = AsyncMock()
         resy_client.find_availability.return_value = [_make_slot("19:00")]
         resy_client.get_booking_details.return_value = {
@@ -1284,7 +1681,7 @@ class TestBookViaResy:
         resy_client.book.return_value = {"error": "Card declined"}
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, {},
         )
@@ -1301,7 +1698,7 @@ class TestBookViaResy:
         restaurant = make_restaurant(name="Carbone")
 
         creds = {"payment_methods": "pm-string-id"}
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, creds,
         )
@@ -1324,7 +1721,7 @@ class TestBookViaResy:
         restaurant = make_restaurant(name="Carbone")
 
         creds = {"payment_methods": 12345}
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, creds,
         )
@@ -1344,7 +1741,7 @@ class TestBookViaResy:
         resy_client.book.return_value = {"resy_token": "RES-NP"}
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, "birthday", {},
         )
@@ -1355,8 +1752,8 @@ class TestBookViaResy:
             payment_method=None,
         )
 
-    async def test_success_payment_list_passes_none(self, db):
-        """When payment_methods is a list, isinstance check fails -> None."""
+    async def test_success_payment_list_of_dicts_uses_first(self, db):
+        """When payment_methods is a list of dicts, first dict is used."""
         resy_client = AsyncMock()
         resy_client.find_availability.return_value = [_make_slot("19:00")]
         resy_client.get_booking_details.return_value = {
@@ -1366,7 +1763,49 @@ class TestBookViaResy:
         restaurant = make_restaurant(name="Carbone")
 
         creds = {"payment_methods": [{"id": 1}]}
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
+            resy_client, db, restaurant, "rv1",
+            "2026-02-14", "19:00", 2, None, creds,
+        )
+        assert result is not None
+        resy_client.book.assert_called_once_with(
+            book_token="bt-xyz",
+            payment_method={"id": 1},
+        )
+
+    async def test_success_payment_list_of_ints_wraps_first(self, db):
+        """When payment_methods is a list of ints, first is wrapped as {'id': ...}."""
+        resy_client = AsyncMock()
+        resy_client.find_availability.return_value = [_make_slot("19:00")]
+        resy_client.get_booking_details.return_value = {
+            "book_token": {"value": "bt-xyz"},
+        }
+        resy_client.book.return_value = {"resy_token": "RES-LINT"}
+        restaurant = make_restaurant(name="Carbone")
+
+        creds = {"payment_methods": [12345]}
+        result, _available = await _book_via_resy(
+            resy_client, db, restaurant, "rv1",
+            "2026-02-14", "19:00", 2, None, creds,
+        )
+        assert result is not None
+        resy_client.book.assert_called_once_with(
+            book_token="bt-xyz",
+            payment_method={"id": 12345},
+        )
+
+    async def test_success_empty_payment_list_passes_none(self, db):
+        """When payment_methods is an empty list, payment_method is None."""
+        resy_client = AsyncMock()
+        resy_client.find_availability.return_value = [_make_slot("19:00")]
+        resy_client.get_booking_details.return_value = {
+            "book_token": {"value": "bt-xyz"},
+        }
+        resy_client.book.return_value = {"resy_token": "RES-EMPTY"}
+        restaurant = make_restaurant(name="Carbone")
+
+        creds = {"payment_methods": []}
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, creds,
         )
@@ -1386,7 +1825,7 @@ class TestBookViaResy:
         resy_client.book.return_value = {"reservation_id": "fallback-id"}
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, None, {},
         )
@@ -1403,7 +1842,7 @@ class TestBookViaResy:
         resy_client.book.return_value = {"resy_token": "RES-SAVE"}
         restaurant = make_restaurant(name="Carbone")
 
-        result = await _book_via_resy(
+        result, _available = await _book_via_resy(
             resy_client, db, restaurant, "rv1",
             "2026-02-14", "19:00", 2, "quiet table", {},
         )
@@ -1635,6 +2074,26 @@ class TestCancelReservation:
             )
         text = str(result)
         assert "Resy auth error" in text
+
+    async def test_resy_cancel_no_credentials(self, booking_mcp):
+        """When no Resy creds available, returns helpful error."""
+        mcp, db, mock_cred_store, _auth = booking_mcp
+        mock_cred_store.get_credentials.return_value = None
+        reservation = make_reservation(
+            restaurant_name="Carbone",
+            date="2099-12-31",
+            platform=BookingPlatform.RESY,
+            platform_confirmation_id="RES-NOCREDS",
+        )
+        await db.save_reservation(reservation)
+
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "cancel_reservation",
+                {"restaurant_name": "Carbone"},
+            )
+        text = str(result)
+        assert "credentials not available" in text
 
     async def test_resy_cancel_fails(self, booking_mcp):
         mcp, db, _store, _auth = booking_mcp
@@ -1871,6 +2330,71 @@ class TestMyReservations:
 # ── _get_credential_store / _get_auth_manager ──────────────────────────────
 
 
+class TestResolveCredential:
+    """Test resolve_credential: ConfigStore → Settings fallback."""
+
+    async def test_returns_from_config_store_when_available(self):
+        mock_cs = AsyncMock()
+        mock_cs.get = AsyncMock(return_value="db-value")
+        with patch("src.server._config_store", mock_cs):
+            result = await resolve_credential("resy_email")
+        assert result == "db-value"
+        mock_cs.get.assert_awaited_once_with("resy_email")
+
+    async def test_falls_back_to_settings_when_config_store_returns_none(self):
+        mock_cs = AsyncMock()
+        mock_cs.get = AsyncMock(return_value=None)
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "env-email"
+        with (
+            patch("src.server._config_store", mock_cs),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await resolve_credential("resy_email")
+        assert result == "env-email"
+
+    async def test_falls_back_to_settings_when_config_store_returns_empty(self):
+        mock_cs = AsyncMock()
+        mock_cs.get = AsyncMock(return_value="")
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "env-email"
+        with (
+            patch("src.server._config_store", mock_cs),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await resolve_credential("resy_email")
+        assert result == "env-email"
+
+    async def test_no_config_store_uses_settings(self):
+        mock_settings = MagicMock()
+        mock_settings.resy_password = "env-pw"
+        with (
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await resolve_credential("resy_password")
+        assert result == "env-pw"
+
+    async def test_returns_none_when_neither_available(self):
+        mock_settings = MagicMock()
+        mock_settings.resy_email = None
+        with (
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await resolve_credential("resy_email")
+        assert result is None
+
+    async def test_settings_attribute_missing_returns_none(self):
+        mock_settings = MagicMock(spec=[])  # no attributes
+        with (
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await resolve_credential("nonexistent_field")
+        assert result is None
+
+
 class TestHelperFactories:
     def test_get_credential_store_returns_store(self, tmp_path):
         """_get_credential_store builds a CredentialStore from settings."""
@@ -1891,3 +2415,240 @@ class TestHelperFactories:
         from src.clients.resy_auth import ResyAuthManager
 
         assert isinstance(manager, ResyAuthManager)
+
+
+# ── _ensure_resy_credentials ──────────────────────────────────────────────
+
+
+class TestEnsureResyCredentials:
+    """Test _ensure_resy_credentials bridging ConfigStore → CredentialStore."""
+
+    async def test_returns_existing_creds_from_store(self):
+        """When CredentialStore already has Resy creds, return them."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = {
+            "email": "a@b.com",
+            "auth_token": "tok",
+            "api_key": "key",
+        }
+        with patch("src.tools.booking._get_credential_store", return_value=mock_store):
+            result = await _ensure_resy_credentials()
+        assert result == {"email": "a@b.com", "auth_token": "tok", "api_key": "key"}
+
+    async def test_auto_auth_from_config_store(self):
+        """When CredentialStore has no creds, bridges from ConfigStore."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+        mock_store.save_credentials = MagicMock()
+
+        mock_auth = AsyncMock()
+        mock_auth.authenticate.return_value = {
+            "auth_token": "new-tok",
+            "api_key": "new-key",
+            "payment_methods": [{"id": 1}],
+        }
+
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "config@test.com"
+        mock_settings.resy_password = "config-pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.tools.booking._get_auth_manager", return_value=mock_auth),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_resy_credentials()
+
+        assert result is not None
+        assert result["email"] == "config@test.com"
+        assert result["auth_token"] == "new-tok"
+        assert result["api_key"] == "new-key"
+        assert result["payment_methods"] == [{"id": 1}]
+        mock_store.save_credentials.assert_called_once_with("resy", result)
+
+    async def test_returns_none_when_no_email(self):
+        """When no email in ConfigStore or Settings, returns None."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+
+        mock_settings = MagicMock()
+        mock_settings.resy_email = None
+        mock_settings.resy_password = "pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_resy_credentials()
+
+        assert result is None
+
+    async def test_returns_none_when_no_password(self):
+        """When no password in ConfigStore or Settings, returns None."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "a@b.com"
+        mock_settings.resy_password = None
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_resy_credentials()
+
+        assert result is None
+
+    async def test_returns_none_on_auth_error(self):
+        """When auto-auth fails with AuthError, returns None."""
+        from src.clients.resy_auth import AuthError
+
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+
+        mock_auth = AsyncMock()
+        mock_auth.authenticate.side_effect = AuthError("bad creds")
+
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "a@b.com"
+        mock_settings.resy_password = "pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.tools.booking._get_auth_manager", return_value=mock_auth),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_resy_credentials()
+
+        assert result is None
+
+    async def test_returns_none_on_generic_exception(self):
+        """When auto-auth fails with generic exception, returns None."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+
+        mock_auth = AsyncMock()
+        mock_auth.authenticate.side_effect = RuntimeError("network down")
+
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "a@b.com"
+        mock_settings.resy_password = "pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.tools.booking._get_auth_manager", return_value=mock_auth),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_resy_credentials()
+
+        assert result is None
+
+    async def test_payment_methods_defaults_to_empty_list(self):
+        """When authenticate result has no payment_methods key, defaults to []."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+        mock_store.save_credentials = MagicMock()
+
+        mock_auth = AsyncMock()
+        mock_auth.authenticate.return_value = {
+            "auth_token": "tok",
+            "api_key": "key",
+        }
+
+        mock_settings = MagicMock()
+        mock_settings.resy_email = "a@b.com"
+        mock_settings.resy_password = "pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.tools.booking._get_auth_manager", return_value=mock_auth),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_resy_credentials()
+
+        assert result is not None
+        assert result["payment_methods"] == []
+
+
+# ── _ensure_opentable_credentials ──────────────────────────────────────────
+
+
+class TestEnsureOpentableCredentials:
+    """Test _ensure_opentable_credentials bridging ConfigStore → CredentialStore."""
+
+    async def test_returns_existing_creds_from_store(self):
+        """When CredentialStore already has OpenTable creds, return them."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = {
+            "email": "ot@test.com",
+            "password": "pw",
+        }
+        with patch("src.tools.booking._get_credential_store", return_value=mock_store):
+            result = await _ensure_opentable_credentials()
+        assert result == {"email": "ot@test.com", "password": "pw"}
+        mock_store.save_credentials.assert_not_called()
+
+    async def test_resolves_from_config_store(self):
+        """When CredentialStore is empty, resolves from ConfigStore/env vars."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+        mock_store.save_credentials = MagicMock()
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_email = "config@test.com"
+        mock_settings.opentable_password = "config-pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_opentable_credentials()
+
+        assert result == {"email": "config@test.com", "password": "config-pw"}
+        mock_store.save_credentials.assert_called_once_with(
+            "opentable", {"email": "config@test.com", "password": "config-pw"},
+        )
+
+    async def test_returns_none_when_no_email(self):
+        """When no email available, returns None."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_email = None
+        mock_settings.opentable_password = "pw"
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_opentable_credentials()
+
+        assert result is None
+
+    async def test_returns_none_when_no_password(self):
+        """When no password available, returns None."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_email = "ot@test.com"
+        mock_settings.opentable_password = None
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_opentable_credentials()
+
+        assert result is None

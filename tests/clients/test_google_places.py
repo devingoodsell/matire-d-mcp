@@ -2,6 +2,7 @@
 
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from src.clients.cache import InMemoryCache
 from src.clients.google_places import (
     COST_PLACE_DETAILS_CENTS,
     COST_SEARCH_TEXT_CENTS,
@@ -487,3 +488,64 @@ class TestSearchNearbyMaxResultsCapped:
 
         body = mock_client.post.call_args.kwargs["json"]
         assert body["maxResultCount"] == 20
+
+
+class TestSearchNearbyCacheHit:
+    """Cache hit returns cached results without API call."""
+
+    async def test_returns_cached_results(self, db):
+        cache = InMemoryCache(max_size=10)
+        client = GooglePlacesClient(api_key="test-key", db=db, cache=cache)
+
+        # Populate cache by doing a real API call first
+        json_data = {"places": [_full_place()]}
+        response = _make_response(json_data=json_data)
+        mock_client = _mock_httpx_client(response=response)
+
+        with patch("src.clients.google_places.httpx.AsyncClient",
+                   return_value=mock_client):
+            first = await client.search_nearby("pizza", lat=40.7128, lng=-74.0060)
+
+        assert len(first) == 1
+
+        # Second call should use cache (no HTTP call)
+        mock_client2 = _mock_httpx_client(
+            response=_make_response(json_data={"places": []})
+        )
+        with patch("src.clients.google_places.httpx.AsyncClient",
+                   return_value=mock_client2):
+            second = await client.search_nearby("pizza", lat=40.7128, lng=-74.0060)
+
+        assert len(second) == 1
+        assert second[0].name == "Joe's Pizza"
+        # HTTP client should NOT have been called for the cache hit
+        mock_client2.post.assert_not_awaited()
+
+    async def test_cache_miss_calls_api(self, db):
+        cache = InMemoryCache(max_size=10)
+        client = GooglePlacesClient(api_key="test-key", db=db, cache=cache)
+
+        json_data = {"places": [_full_place()]}
+        response = _make_response(json_data=json_data)
+        mock_client = _mock_httpx_client(response=response)
+
+        with patch("src.clients.google_places.httpx.AsyncClient",
+                   return_value=mock_client):
+            results = await client.search_nearby("sushi", lat=40.7, lng=-74.0)
+
+        assert len(results) == 1
+        mock_client.post.assert_awaited_once()
+
+    async def test_cache_stores_results(self, db):
+        cache = InMemoryCache(max_size=10)
+        client = GooglePlacesClient(api_key="test-key", db=db, cache=cache)
+
+        json_data = {"places": [_full_place()]}
+        response = _make_response(json_data=json_data)
+        mock_client = _mock_httpx_client(response=response)
+
+        with patch("src.clients.google_places.httpx.AsyncClient",
+                   return_value=mock_client):
+            await client.search_nearby("pizza", lat=40.7128, lng=-74.0060)
+
+        assert cache.size == 1

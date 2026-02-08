@@ -5,7 +5,7 @@ from fastmcp import FastMCP
 from src.clients.geocoding import geocode_address
 from src.models.enums import Ambiance, CuisineCategory, PriceLevel, SeatingPreference
 from src.models.user import CuisinePreference, Location, PricePreference, UserPreferences
-from src.server import get_db
+from src.server import get_db, resolve_credential
 
 logger = logging.getLogger(__name__)
 
@@ -87,9 +87,7 @@ def register_preference_tools(mcp: FastMCP) -> None:
             await db.set_price_preferences(price_prefs)
 
         # Geocode and save locations
-        from src.config import get_settings
-
-        api_key = get_settings().google_api_key
+        api_key = await resolve_credential("google_api_key") or ""
         saved_locations: list[str] = []
 
         for label, address in [("home", home_address), ("work", work_address)]:

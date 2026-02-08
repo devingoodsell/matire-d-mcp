@@ -106,11 +106,18 @@ class GooglePlacesClient:
     Args:
         api_key: Google API key.
         db: Optional DatabaseManager for cost tracking and caching.
+        cache: Optional InMemoryCache for search results.
     """
 
-    def __init__(self, api_key: str, db: object | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        db: object | None = None,
+        cache: object | None = None,
+    ) -> None:
         self.api_key = api_key
         self.db = db
+        self.cache = cache
 
     async def _log_api_call(
         self, endpoint: str, cost_cents: float, status_code: int, cached: bool
@@ -145,6 +152,14 @@ class GooglePlacesClient:
         Returns:
             List of Restaurant models parsed from API response.
         """
+        # Cache-aside: check cache first
+        cache_key = f"search:{query}:{lat:.4f}:{lng:.4f}:{radius_meters}:{max_results}"
+        if self.cache is not None:
+            cached = self.cache.get(cache_key)  # type: ignore[union-attr]
+            if cached is not None:
+                await self._log_api_call("searchText", 0.0, 200, True)
+                return cached  # type: ignore[return-value]
+
         headers = {
             "X-Goog-Api-Key": self.api_key,
             "X-Goog-FieldMask": SEARCH_FIELD_MASK,
@@ -178,7 +193,13 @@ class GooglePlacesClient:
 
         data = response.json()
         places = data.get("places", [])
-        return [parse_place(p) for p in places]
+        results = [parse_place(p) for p in places]
+
+        # Store in cache
+        if self.cache is not None:
+            self.cache.set(cache_key, results)  # type: ignore[union-attr]
+
+        return results
 
     async def get_place_details(self, place_id: str) -> Restaurant | None:
         """Get detailed info for a single place.

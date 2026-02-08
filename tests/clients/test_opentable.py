@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from src.clients.opentable import OpenTableClient
+from src.clients.opentable import OpenTableClient, _build_restaurant_url
 from src.clients.resy_auth import AuthError
 from src.models.enums import BookingPlatform
 from src.storage.credentials import CredentialStore
@@ -40,6 +40,7 @@ def _mock_browser_chain():
     page = _mock_page()
     context = AsyncMock()
     context.new_page = AsyncMock(return_value=page)
+    context.add_init_script = AsyncMock()
     browser = AsyncMock()
     browser.new_context = AsyncMock(return_value=context)
     browser.close = AsyncMock()
@@ -75,6 +76,31 @@ def _make_client_with_browser(tmp_path, page, browser, pw_instance):
     client._page = page
     client._pw = pw_instance
     return client
+
+
+# ---- _build_restaurant_url --------------------------------------------------
+
+
+class TestBuildRestaurantUrl:
+    """_build_restaurant_url: correct OpenTable URL format with covers/dateTime."""
+
+    def test_basic_url(self):
+        result = _build_restaurant_url(
+            "https://www.opentable.com", "carbone-new-york",
+            "2026-02-14", 2, "19:00",
+        )
+        assert result == (
+            "https://www.opentable.com/r/carbone-new-york"
+            "?covers=2&dateTime=2026-02-14T19%3A00"
+        )
+
+    def test_large_party(self):
+        result = _build_restaurant_url(
+            "https://www.opentable.com", "slug",
+            "2026-03-01", 8, "18:30",
+        )
+        assert "covers=8" in result
+        assert "dateTime=2026-03-01T18%3A30" in result
 
 
 # ---- _parse_time (static method) -------------------------------------------
@@ -122,6 +148,9 @@ class TestEnsureBrowser:
         assert client._page is page
         assert client._pw is pw_instance
         pw_instance.chromium.launch.assert_awaited_once()
+        # Verify headless=True for server compatibility
+        call_kwargs = pw_instance.chromium.launch.call_args[1]
+        assert call_kwargs["headless"] is True
 
     async def test_second_call_is_noop(self, tmp_path):
         mock_apw, page, browser, pw_instance = _mock_browser_chain()
@@ -223,7 +252,7 @@ class TestLogin:
         page.fill.assert_any_await('input[name="email"]', "u@x.com")
         page.fill.assert_any_await('input[name="password"]', "pw123")
         page.click.assert_awaited_once_with('button[type="submit"]')
-        page.wait_for_load_state.assert_awaited_once_with("networkidle")
+        page.wait_for_load_state.assert_awaited_once_with("domcontentloaded")
 
     async def test_page_interaction_fails_raises_auth_error(self, tmp_path):
         store = _make_credential_store(tmp_path)
@@ -269,6 +298,25 @@ class TestFindAvailability:
         assert slots[0].time == "19:00"
         assert slots[0].platform == BookingPlatform.OPENTABLE
         assert slots[1].time == "20:30"
+
+    async def test_empty_text_slots_skipped(self, tmp_path):
+        mock_apw, page, browser, pw_instance = _mock_browser_chain()
+
+        slot1 = AsyncMock()
+        slot1.inner_text = AsyncMock(return_value="7:00 PM")
+        slot_empty = AsyncMock()
+        slot_empty.inner_text = AsyncMock(return_value="  ")
+        page.query_selector_all.return_value = [slot1, slot_empty]
+
+        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
+
+        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
+            slots = await client.find_availability(
+                "carbone-new-york", "2025-03-15", 2, "19:00"
+            )
+
+        assert len(slots) == 1
+        assert slots[0].time == "19:00"
 
     async def test_no_slots_returns_empty(self, tmp_path):
         mock_apw, page, browser, pw_instance = _mock_browser_chain()

@@ -129,6 +129,10 @@ class ResyClient:
             # Extract just the time portion (HH:MM) from datetime string
             if " " in time_str:
                 time_str = time_str.split(" ")[-1]
+            # Normalise to HH:MM (strip seconds if present)
+            time_parts = time_str.split(":")
+            if len(time_parts) >= 2:
+                time_str = f"{time_parts[0]}:{time_parts[1]}"
 
             slots.append(
                 TimeSlot(
@@ -255,29 +259,20 @@ class ResyClient:
         data = response.json()
         return data if isinstance(data, list) else data.get("reservations", [])
 
-    async def search_venue(
-        self, query: str, lat: float, lng: float
-    ) -> list[dict]:
-        """Search for a Resy venue by name/location.
+    async def search_venue(self, query: str) -> list[dict]:
+        """Search for a Resy venue by name.
 
         Args:
             query: Restaurant name.
-            lat: Latitude.
-            lng: Longitude.
 
         Returns:
             List of venue dicts with id, name, location info.
         """
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                f"{self.BASE_URL}/4/venue/search",
+            response = await client.post(
+                f"{self.BASE_URL}/3/venuesearch/search",
                 headers=self._headers(),
-                params={
-                    "query": query,
-                    "lat": lat,
-                    "long": lng,
-                    "per_page": 5,
-                },
+                json={"query": query},
             )
 
         if response.status_code != 200:
@@ -289,11 +284,21 @@ class ResyClient:
 
         data = response.json()
         hits = data.get("search", {}).get("hits", [])
-        return [
-            {
-                "id": str(h.get("id", {}).get("resy", "")),
-                "name": h.get("name", ""),
-                "location": h.get("location", {}),
-            }
-            for h in hits
-        ]
+        return [self._parse_venue_hit(h) for h in hits]
+
+    @staticmethod
+    def _parse_venue_hit(hit: dict) -> dict:
+        """Normalise a venue search hit into {id, name, location}."""
+        # Try nested id.resy first, fall back to objectID / top-level id
+        raw_id = hit.get("id", "")
+        if isinstance(raw_id, dict):
+            venue_id = str(raw_id.get("resy") or "")
+        else:
+            venue_id = str(
+                hit.get("objectID", raw_id) or ""
+            )
+        return {
+            "id": venue_id,
+            "name": hit.get("name", ""),
+            "location": hit.get("location", {}),
+        }

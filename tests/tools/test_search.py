@@ -822,7 +822,7 @@ class TestWeatherAwareSearch:
     @pytest.fixture
     def no_key_search_mcp(self, db, monkeypatch):
         """Return (mcp, db) WITHOUT weather API key."""
-        monkeypatch.delenv("OPENWEATHER_API_KEY", raising=False)
+        monkeypatch.setenv("OPENWEATHER_API_KEY", "")
         from src.config import reset_settings
 
         reset_settings()

@@ -21,6 +21,7 @@ You: "Carbone at 6:30"
 
 Claude: ✓ Booked! Carbone, Saturday 6:30 PM, 2 people
         Confirmation: RESY-ABC123
+        Add to Google Calendar: https://calendar.google.com/calendar/render?...
 ```
 
 ## Key Features
@@ -34,7 +35,317 @@ Claude: ✓ Booked! Carbone, Saturday 6:30 PM, 2 people
 | **Recency Tracking** | Won't suggest Mexican if you had it yesterday |
 | **Weather Aware** | No outdoor seating suggestions in winter/rain |
 | **Visit History** | Tracks where you've been, resurfaces favorites |
-| **Calendar Sync** | Add reservations to Google Calendar automatically |
+| **Calendar Sync** | Add reservations to Google Calendar with one click |
+| **Cost Tracking** | Monitor your API usage costs |
+| **Resilient** | Retry with backoff, circuit breakers, graceful fallbacks |
+
+## Quick Start
+
+### 1. Prerequisites
+
+- Python 3.11+
+- [Claude Desktop](https://claude.ai/download) installed
+- Google Cloud API key (Places API enabled)
+
+### 2. Clone & Install
+
+```bash
+git clone <repo>
+cd restaurant-mcp
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+playwright install chromium
+```
+
+### 3. Run Setup (Recommended)
+
+The interactive setup encrypts all secrets into the local database and generates your Claude Desktop config:
+
+```bash
+source .venv/bin/activate
+python -m src.setup
+```
+
+You will be prompted for:
+- **Google API Key** (required) — Google Cloud Console → Places API (New)
+- **OpenWeather API Key** (optional) — openweathermap.org (free tier: 1000/day)
+- **Resy credentials** (optional) — for automated Resy booking
+- **OpenTable credentials** (optional) — for automated OpenTable booking
+
+The script outputs a ready-to-paste Claude Desktop config with a single `RESTAURANT_MCP_KEY` env var. No `.env` file needed.
+
+### 4. Configure Claude Desktop
+
+Copy the JSON output from step 3 into your Claude Desktop MCP config file:
+
+- **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
+- **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
+
+The config should look like:
+
+```json
+{
+  "mcpServers": {
+    "restaurant": {
+      "command": "/path/to/restaurant-mcp/.venv/bin/python",
+      "args": ["-m", "src"],
+      "cwd": "/path/to/restaurant-mcp",
+      "env": {
+        "RESTAURANT_MCP_KEY": "your-generated-master-key"
+      }
+    }
+  }
+}
+```
+
+Replace paths with the actual paths from the setup output.
+
+<details>
+<summary><b>Alternative: .env file (legacy mode)</b></summary>
+
+If you prefer not to use the setup script, create a `.env` file manually:
+
+```bash
+# Required — Google Cloud Console → APIs & Services → Places API (New)
+GOOGLE_API_KEY=your_google_api_key
+
+# Optional — openweathermap.org (free tier: 1000 calls/day)
+OPENWEATHER_API_KEY=your_openweather_key
+
+# Optional — booking credentials
+RESY_EMAIL=me@example.com
+RESY_PASSWORD=mypassword
+OPENTABLE_EMAIL=me@example.com
+OPENTABLE_PASSWORD=mypassword
+```
+
+In legacy mode, the Claude Desktop config needs only the command — no `env` block required, since `.env` in the `cwd` is loaded automatically:
+
+```json
+{
+  "mcpServers": {
+    "restaurant": {
+      "command": "/path/to/restaurant-mcp/.venv/bin/python",
+      "args": ["-m", "src"],
+      "cwd": "/path/to/restaurant-mcp"
+    }
+  }
+}
+```
+
+</details>
+
+### 5. Restart Claude Desktop
+
+Quit and reopen Claude Desktop. You should see the restaurant tools available (hammer icon in the chat input).
+
+### 6. First Run — Set Up Your Profile
+
+Start a conversation with Claude:
+
+```
+You: "Help me set up my restaurant preferences"
+
+Claude: Let's get you set up! First, what's your home address?
+        (I'll use this as "near home" when you search)
+
+You: "123 Main St, New York, NY 10001"
+
+Claude: Got it. Where do you work?
+
+You: "456 Park Ave, New York, NY 10022"
+
+Claude: What are your favorite cuisines?
+
+You: "Italian, Japanese, Mexican"
+
+Claude: Any dietary restrictions?
+
+You: "None for me"
+
+Claude: ✓ Profile saved! You're all set.
+```
+
+### 7. Add Dining Companions
+
+```
+You: "Add my wife — she has a nut allergy and a seed allergy"
+
+Claude: ✓ Saved! I'll remember her allergies when searching restaurants.
+
+You: "Create a group called 'date night' with my wife"
+
+Claude: ✓ Group 'date night' created. Merged restrictions: nut allergy, seed allergy.
+```
+
+### 8. Store Booking Credentials
+
+If you provided Resy/OpenTable credentials during `python -m src.setup`, they are already encrypted in the database. Just tell Claude:
+
+```
+You: "Set up my Resy account for booking"
+
+Claude: ✓ Resy credentials saved and validated!
+```
+
+If you skipped booking credentials during setup, you can add them later via env vars in `.env` or by passing them as tool arguments (note: arguments are visible in chat history).
+
+### Security Model
+
+| Layer | Protection |
+|-------|-----------|
+| **Setup script** | `python -m src.setup` — passwords entered via `getpass` (not echoed), never in chat |
+| **Single secret** | One master key (`RESTAURANT_MCP_KEY`) replaces 6+ scattered secrets |
+| **Encryption at rest** | Fernet (AES-128-CBC) via PBKDF2-derived key; all config in SQLite `app_config` table |
+| **Legacy mode** | `.env` file + OS keyring/file-based Fernet key still supported |
+| **Resy password** | NOT persisted after authentication — only email + auth token stored |
+| **OpenTable password** | Stored encrypted (required for every Playwright session) |
+| **File permissions** | Credentials dir 0o700, all files 0o600 |
+
+Install the optional `keyring` dependency for OS keyring support (legacy mode):
+
+```bash
+pip install -e ".[security]"
+```
+
+## Example Prompts
+
+### Discovery
+- "Find Italian restaurants near home"
+- "What's good for dinner near work tonight?"
+- "Show me highly-rated sushi places within walking distance"
+- "Find restaurants good for a group of 6 near Union Square"
+
+### Booking
+- "Check availability at Carbone for Saturday at 7 PM, party of 2"
+- "Book L'Artusi for Friday at 8, party of 4"
+- "What reservations do I have coming up?"
+- "Cancel my reservation at Via Carota"
+
+### Group Dining
+- "Find a restaurant for date night this Saturday"
+- "Search for a place that works for the whole family — remember everyone's allergies"
+
+### Recommendations
+- "What should we try tonight? We haven't been out in a week"
+- "Recommend something new — I'm tired of Italian"
+- "What's good for outdoor dining today?" *(checks weather automatically)*
+
+### History & Preferences
+- "Log that we went to Lilia last night — it was amazing, 5 stars"
+- "Where have we eaten in the last month?"
+- "Update my preferences — add Thai to my favorite cuisines"
+- "Blacklist TGI Friday's — never suggest it again"
+
+### Cost Tracking
+- "How much have I spent on API calls this month?"
+
+## MCP Tools (22 total)
+
+| Tool | Purpose |
+|------|---------|
+| `setup_preferences` | First-run profile setup (home, work, cuisines, dietary) |
+| `get_my_preferences` | View current preferences |
+| `update_preferences` | Change specific preferences |
+| `manage_person` | Add/update/remove dining companions |
+| `list_people` | Show all saved companions |
+| `manage_group` | Create/update/remove groups |
+| `list_groups` | Show all saved groups |
+| `manage_blacklist` | Block/unblock restaurants |
+| `search_restaurants` | Find restaurants by cuisine, location, rating |
+| `check_availability` | Check time slots across Resy + OpenTable |
+| `make_reservation` | Book a table (with calendar link) |
+| `cancel_reservation` | Cancel a booking |
+| `my_reservations` | View upcoming reservations |
+| `store_resy_credentials` | Save Resy login (encrypted) |
+| `store_opentable_credentials` | Save OpenTable login (encrypted) |
+| `log_visit` | Record a restaurant visit |
+| `rate_visit` | Rate a past visit |
+| `visit_history` | View dining history |
+| `get_recommendations` | Get personalized suggestions |
+| `search_for_group` | Find restaurants for a group (merged dietary needs) |
+| `api_costs` | View API usage costs and cache stats |
+
+## API Costs
+
+| API | Cost | Usage |
+|-----|------|-------|
+| Google Places | ~$17/1000 detail calls | Primary discovery |
+| OpenWeatherMap | Free (1000/day) | Weather context |
+| Resy | Free (unofficial) | Booking |
+| OpenTable | Free (browser automation) | Booking |
+
+**Estimated monthly cost for heavy use:** $3-8 (with caching)
+
+Use `api_costs` to monitor your spending at any time.
+
+## Architecture
+
+### Technical Stack
+
+- **Language:** Python 3.11+
+- **Framework:** [FastMCP](https://gofastmcp.com) — auto-generates tool schemas from type hints
+- **Storage:** SQLite (local, WAL mode) with aiosqlite
+- **Browser Automation:** Playwright (for auth + OpenTable)
+- **APIs:** Google Places (New), OpenWeatherMap, Resy (unofficial), OpenTable (automation)
+- **Calendar:** Google Calendar URL generation (zero-config)
+- **Resilience:** tenacity (retry), custom CircuitBreaker, InMemoryCache (LRU + TTL)
+
+### Resilience Features
+
+- **Retry with exponential backoff** — transient errors (429, 5xx) are automatically retried up to 3 times
+- **Circuit breakers** — per-service (Resy, Google Places, OpenTable, Weather) to prevent hammering failed APIs
+- **3-layer booking fallback** — Resy API -> OpenTable Playwright -> deep links with manual instructions
+- **In-memory caching** — LRU cache with TTL for search results, reducing API costs
+- **User-friendly errors** — all exceptions are mapped to actionable messages for Claude to relay
+
+### Project Structure
+
+```
+restaurant-mcp/
+├── .ai/
+│   ├── AGENTS.md               # Agent instructions
+│   └── ENGINEERING-STANDARDS.md # Code patterns, testing mandate
+├── docs/
+│   ├── specs/                   # EPICs, architecture plan, research
+│   └── adr/                     # Architecture Decision Records
+├── scripts/
+│   ├── validate.sh              # Full validation: lint + test + coverage
+│   ├── test.sh                  # Run tests with coverage
+│   └── lint.sh                  # Ruff linting only
+├── src/
+│   ├── server.py                # FastMCP entry point
+│   ├── config.py                # Environment configuration
+│   ├── models/                  # Pydantic data models
+│   ├── storage/                 # SQLite + encrypted credentials
+│   ├── clients/                 # API clients + resilience + cache
+│   ├── matching/                # Cross-platform venue ID resolution
+│   └── tools/                   # MCP tool definitions
+├── tests/                       # 945 tests, 100% branch coverage
+├── data/                        # Runtime: DB, logs, credentials (gitignored)
+├── pyproject.toml
+├── .env.example
+└── README.md
+```
+
+## Development
+
+```bash
+# Activate virtual environment
+source .venv/bin/activate
+
+# Run full validation (lint + tests + coverage + import check)
+bash scripts/validate.sh
+
+# Run tests only
+bash scripts/test.sh
+
+# Run linter only
+bash scripts/lint.sh
+```
+
+**Testing:** 945 tests with 100% branch coverage (`fail_under = 100` enforced).
 
 ## Prior Art
 
@@ -57,174 +368,18 @@ Several MCP restaurant reservation servers already exist — these serve as refe
 | [ENGINEERING-STANDARDS.md](./.ai/ENGINEERING-STANDARDS.md) | Code patterns, architecture rules, testing mandate |
 | [EPICS-INDEX.md](./docs/specs/EPICS-INDEX.md) | Master EPIC guide — dependency graph, tool inventory |
 | [ARCHITECTURE_PLAN.md](./docs/specs/ARCHITECTURE_PLAN.md) | High-level architecture, API landscape, data models |
-| [RESEARCH.md](./docs/specs/RESEARCH.md) | Background research on APIs, ecosystem, legal |
-
-## Implementation Timeline
-
-```
-Week 1-2: Phase 1 - Foundation
-          ✓ FastMCP server skeleton (outcome-oriented tools)
-          ✓ Google Places integration
-          ✓ Friends + Friend Groups storage
-          → "Find Italian near home" works
-
-Week 3-4: Phase 2 - Resy + OpenTable
-          ✓ Resy: API-first with Playwright auth refresh
-          ✓ OpenTable: Playwright browser automation
-          ✓ Availability checking (both platforms)
-          ✓ Booking + cancellation (both platforms)
-          ✓ Google Calendar integration (day-one feature)
-          → "Book Carbone for Saturday" works (Resy or OpenTable)
-
-Week 5-6: Phase 3 - Intelligence Layer
-          ✓ Weather-aware recommendations
-          ✓ Recency-based suggestions
-          ✓ Learning from your reviews
-          → Smart recs that know your preferences
-
-Week 7-8: Phase 4 - Polish + Resilience
-          ✓ Fallback layers (API → Playwright → deep links)
-          ✓ Circuit breaker pattern for API failures
-          ✓ API schema change monitoring
-          ✓ Performance optimization (3-tier caching)
-          → Production-ready with graceful degradation
-```
-
-## Quick Start (After Building)
-
-### 1. Get API Keys
-
-```bash
-# Required
-GOOGLE_API_KEY=...          # Google Cloud Console → Places API
-OPENWEATHER_API_KEY=...     # openweathermap.org (free tier)
-
-# Stored securely by the app
-RESY_EMAIL=...
-RESY_PASSWORD=...
-```
-
-### 2. Install
-
-```bash
-git clone <repo>
-cd restaurant-mcp
-python -m venv venv
-source venv/bin/activate
-pip install -e .
-```
-
-### 3. Configure Claude Desktop
-
-Add to `~/.claude/claude_desktop_config.json`:
-
-```json
-{
-  "mcpServers": {
-    "restaurant": {
-      "command": "python",
-      "args": ["-m", "src.server"],
-      "cwd": "/path/to/restaurant-mcp",
-      "env": {
-        "GOOGLE_API_KEY": "your_key",
-        "OPENWEATHER_API_KEY": "your_key"
-      }
-    }
-  }
-}
-```
-
-### 4. First Run - Setup Wizard
-
-```
-You: "Help me set up my restaurant preferences"
-
-Claude: Let's get you set up! First, what's your home address?
-        (I'll use this as "near home" when you search)
-
-You: "123 Example St, New York, NY 10001"
-
-Claude: Got it. Where do you work?
-... (continues with cuisine preferences, dietary restrictions, etc.)
-```
-
-### 5. Store Resy Credentials
-
-```
-You: "Set up my Resy account for booking"
-
-Claude: I'll need your Resy email and password to book on your behalf.
-        These are encrypted and stored locally.
-
-You: "Email: me@example.com, Password: ..."
-
-Claude: ✓ Resy credentials saved and validated!
-```
-
-## API Costs
-
-| API | Cost | Usage |
-|-----|------|-------|
-| Google Places | ~$17/1000 detail calls | Primary discovery |
-| Google Distance Matrix | ~$5/1000 calls | Walking time |
-| OpenWeatherMap | Free (1000/day) | Weather context |
-| Resy | Free (unofficial) | Booking |
-| OpenTable | Free (browser automation) | Booking |
-
-**Estimated monthly cost for heavy use:** $5-15
-
-## Technical Stack
-
-- **Language:** Python 3.11+
-- **Framework:** FastMCP (gofastmcp.com) — auto-generates tool schemas from type hints
-- **Storage:** SQLite (local) → Cloud migration path
-- **Browser Automation:** Playwright (for auth + OpenTable)
-- **APIs:** Google Places, OpenWeatherMap, Resy (unofficial), OpenTable (automation)
-- **Calendar:** Google Calendar API for reservation sync
-
-## Project Structure
-
-```
-restaurant-mcp/
-├── .ai/
-│   ├── AGENTS.md               # Agent instructions (system prompt for AI engineers)
-│   └── ENGINEERING-STANDARDS.md # Code patterns, architecture rules, testing mandate
-├── docs/
-│   ├── specs/                  # EPICs, architecture plan, research
-│   └── adr/                    # Architecture Decision Records
-├── scripts/
-│   ├── validate.sh             # Full validation: lint + typecheck + test + coverage
-│   ├── test.sh                 # Run tests with coverage
-│   └── lint.sh                 # Ruff linting only
-├── src/
-│   ├── server.py               # MCP entry point
-│   ├── config.py               # Environment configuration
-│   ├── models/                 # Pydantic data models
-│   ├── storage/                # SQLite + encrypted credentials
-│   ├── clients/                # API clients (Google, Resy, OpenTable, Weather)
-│   ├── matching/               # Cross-platform venue ID resolution
-│   └── tools/                  # MCP tool definitions
-├── tests/                      # Test suite (mirrors src/ structure)
-├── data/
-│   ├── restaurant.db           # SQLite: preferences, history, cache, API logs
-│   ├── logs/                   # Debug logs (rotated)
-│   └── .credentials/           # Encrypted (gitignored)
-├── pyproject.toml
-├── .env.example
-├── .gitignore
-└── README.md
-```
+| [ADR-001](./docs/adr/001-epic08-resilience-decisions.md) | EPIC-08 resilience implementation decisions |
 
 ## Risks & Mitigations
 
 | Risk | Mitigation |
 |------|------------|
-| **Resy API brittleness** | 3-6 month breakage cycle documented; implement fallback layers (API → Playwright → deep links) |
-| Resy blocks unofficial API | Keep request rates low; have OpenTable fallback |
-| Resy auth tokens expire | Auto-refresh via Playwright login (hourly cron pattern) |
-| OpenTable bot detection | Use realistic delays (>30s between checks); Playwright browser automation |
-| Google API costs spike | Aggressive caching (24hr TTL for metadata, 5-15min for availability) |
-| **Account deactivation** | Use personal accounts only; avoid commercial patterns |
+| **Resy API brittleness** | 3-6 month breakage cycle; 3-layer fallback (API -> Playwright -> deep links) |
+| Resy blocks unofficial API | Low request rates; OpenTable fallback |
+| Resy auth tokens expire | Auto-refresh via Playwright login |
+| OpenTable bot detection | Realistic delays (>30s); Playwright browser automation |
+| Google API costs spike | In-memory LRU cache with 5-min TTL; cost tracking via `api_costs` tool |
+| **Account deactivation** | Personal accounts only; no commercial patterns |
 
 ### Legal Considerations
 
@@ -235,12 +390,13 @@ The **NY Restaurant Reservation Anti-Piracy Act** (S.9365A, effective February 2
 ## Future Ideas
 
 - [ ] LA expansion (after NYC is stable)
-- [ ] Shared preferences with wife (two-user mode)
+- [ ] Shared preferences with partner (two-user mode)
 - [ ] Restaurant deal tracking (NYC Restaurant Week, etc.)
 - [ ] Tock integration (ticketed dining experiences)
 - [ ] Yelp integration (official MCP server exists with booking support)
-- [ ] Voice assistant compatibility (Slang AI, PolyAI patterns)
+- [ ] Google Calendar API (OAuth2) for automatic sync (currently URL-based)
+- [ ] SQLite cache tier for cross-session persistence
 
 ---
 
-**Status:** Planning complete. Ready to build Phase 1.
+**Status:** All 8 EPICs complete. 945 tests, 100% branch coverage.

@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from src.server import _reset_db, app_lifespan, get_db, initialize, mcp, setup_logging
+from src.server import (
+    _reset_config_store,
+    _reset_db,
+    app_lifespan,
+    get_config_store,
+    get_db,
+    initialize,
+    mcp,
+    setup_logging,
+)
 
 
 class TestSetupLogging:
@@ -118,12 +127,14 @@ class TestAppLifespan:
 
         reset_settings()
         _reset_db()
+        _reset_config_store()
 
     def teardown_method(self):
         from src.config import reset_settings
 
         reset_settings()
         _reset_db()
+        _reset_config_store()
 
     async def test_lifespan_initializes_and_closes_db(self, tmp_path, monkeypatch):
         monkeypatch.setenv("DATA_DIR", str(tmp_path))
@@ -142,6 +153,26 @@ class TestAppLifespan:
 
         async with app_lifespan(mcp):
             assert (tmp_path / "restaurant.db").exists()
+
+    async def test_lifespan_no_config_store_without_master_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("RESTAURANT_MCP_KEY", raising=False)
+
+        async with app_lifespan(mcp):
+            assert get_config_store() is None
+
+    async def test_lifespan_creates_config_store_with_master_key(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("RESTAURANT_MCP_KEY", "test-master-key")
+
+        async with app_lifespan(mcp):
+            cs = get_config_store()
+            assert cs is not None
+            from src.storage.config_store import ConfigStore
+            assert isinstance(cs, ConfigStore)
+
+        # After lifespan exits, config_store should be None
+        assert get_config_store() is None
 
 
 class TestGetDb:
@@ -172,6 +203,19 @@ class TestGetDb:
         reset_settings()
 
 
+class TestGetConfigStore:
+    """Test the get_config_store accessor."""
+
+    def setup_method(self):
+        _reset_config_store()
+
+    def teardown_method(self):
+        _reset_config_store()
+
+    def test_returns_none_when_not_initialized(self):
+        assert get_config_store() is None
+
+
 class TestResetDb:
     """Test the _reset_db helper."""
 
@@ -181,3 +225,14 @@ class TestResetDb:
         server_module._db = "sentinel"  # type: ignore[assignment]
         _reset_db()
         assert server_module._db is None
+
+
+class TestResetConfigStore:
+    """Test the _reset_config_store helper."""
+
+    def test_reset_config_store_clears_reference(self):
+        import src.server as server_module
+
+        server_module._config_store = "sentinel"  # type: ignore[assignment]
+        _reset_config_store()
+        assert server_module._config_store is None

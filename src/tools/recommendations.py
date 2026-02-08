@@ -4,13 +4,16 @@ import logging
 
 from fastmcp import FastMCP
 
+from src.clients.cache import InMemoryCache
 from src.clients.distance import walking_minutes
 from src.clients.geocoding import geocode_address
 from src.clients.google_places import GooglePlacesClient
 from src.models.restaurant import Restaurant
-from src.server import get_db
+from src.server import get_db, resolve_credential
 
 logger = logging.getLogger(__name__)
+
+_recommendation_cache = InMemoryCache(max_size=100)
 
 # Price level display symbols
 _PRICE_SYMBOLS = {1: "$", 2: "$$", 3: "$$$", 4: "$$$$"}
@@ -134,10 +137,8 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
         Returns:
             Curated list of 3-5 restaurants with reasons for each recommendation.
         """
-        from src.config import get_settings
-
         db = get_db()
-        settings = get_settings()
+        google_key = await resolve_credential("google_api_key") or ""
 
         # Resolve location
         user_lat: float | None = None
@@ -147,7 +148,7 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
         if saved_loc:
             user_lat, user_lng = saved_loc.lat, saved_loc.lng
         else:
-            coords = await geocode_address(location, settings.google_api_key)
+            coords = await geocode_address(location, google_key)
             if coords:
                 user_lat, user_lng = coords
             else:
@@ -211,12 +212,13 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
             search_query = "casual restaurant"
 
         # Weather check for outdoor recommendation
+        weather_key = await resolve_credential("openweather_api_key")
         weather_note = ""
-        if settings.openweather_api_key:
+        if weather_key:
             try:
                 from src.clients.weather import WeatherClient
 
-                weather_client = WeatherClient(settings.openweather_api_key)
+                weather_client = WeatherClient(weather_key)
                 weather = await weather_client.get_weather(user_lat, user_lng)
                 if weather.outdoor_suitable:
                     temp = weather.temperature_f
@@ -225,7 +227,9 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
                 pass
 
         radius_m = int(walk_limit * 83 / 1.3)
-        places_client = GooglePlacesClient(api_key=settings.google_api_key, db=db)
+        places_client = GooglePlacesClient(
+            api_key=google_key, db=db, cache=_recommendation_cache
+        )
         results = await places_client.search_nearby(
             query=search_query,
             lat=user_lat,
@@ -331,10 +335,8 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
         Returns:
             Restaurant recommendations with notes on dietary compatibility.
         """
-        from src.config import get_settings
-
         db = get_db()
-        settings = get_settings()
+        google_key = await resolve_credential("google_api_key") or ""
 
         # Load group
         grp = await db.get_group(group_name)
@@ -372,7 +374,7 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
         if saved_loc:
             user_lat, user_lng = saved_loc.lat, saved_loc.lng
         else:
-            coords = await geocode_address(location, settings.google_api_key)
+            coords = await geocode_address(location, google_key)
             if coords:
                 user_lat, user_lng = coords
             else:
@@ -388,7 +390,9 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
         walk_limit = prefs.max_walk_minutes if prefs else 15
         radius_m = int(walk_limit * 83 / 1.3)
 
-        places_client = GooglePlacesClient(api_key=settings.google_api_key, db=db)
+        places_client = GooglePlacesClient(
+            api_key=google_key, db=db, cache=_recommendation_cache
+        )
         results = await places_client.search_nearby(
             query=search_query,
             lat=user_lat,

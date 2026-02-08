@@ -4,14 +4,13 @@ import logging
 
 import httpx
 
+from src.clients.resilience import AuthError
 from src.clients.resy import ResyClient
 from src.storage.credentials import CredentialStore
 
 logger = logging.getLogger(__name__)
 
-
-class AuthError(Exception):
-    """Raised when authentication fails on both API and Playwright paths."""
+__all__ = ["AuthError", "ResyAuthManager"]
 
 
 class ResyAuthManager:
@@ -138,11 +137,22 @@ class ResyAuthManager:
         logger.info("Resy token expired, re-authenticating")
         email = creds.get("email", "")
         password = creds.get("password", "")
+
+        # Password may not be in stored creds (security improvement) — try
+        # ConfigStore (master-key mode), then env var
+        if not password:
+            from src.server import resolve_credential
+
+            password = await resolve_credential("resy_password") or ""
+
         if not email or not password:
-            raise AuthError("Stored credentials missing email or password.")
+            raise AuthError(
+                "Token expired. Set RESY_PASSWORD env var or re-run store_resy_credentials."
+            )
 
         new_creds = await self.authenticate(email, password)
         merged = {**creds, **new_creds}
+        merged.pop("password", None)
         self.credential_store.save_credentials("resy", merged)
         return new_creds["auth_token"]
 

@@ -35,7 +35,7 @@ EPIC-08: Resilience & Production ───┘
 | 5 | Resy Integration | [EPIC-05](./EPIC-05-RESY-INTEGRATION.md) | Check availability + book on Resy |
 | 6 | OpenTable Integration | [EPIC-06](./EPIC-06-OPENTABLE-INTEGRATION.md) | Check availability + book on OpenTable |
 | 7 | Intelligence Layer | [EPIC-07](./EPIC-07-INTELLIGENCE-LAYER.md) | Weather, recency, recommendations |
-| 8 | Resilience & Production | [EPIC-08](./EPIC-08-RESILIENCE-AND-PRODUCTION.md) | Retry, circuit breakers, caching, calendar |
+| 8 | Resilience & Production | [EPIC-08](./EPIC-08-RESILIENCE-AND-PRODUCTION.md) | Retry, circuit breakers, caching, calendar (**complete**) |
 
 **Parallelism opportunities:**
 - EPIC-05 and EPIC-06 can be developed in parallel after EPIC-04
@@ -119,7 +119,8 @@ restaurant-mcp/
 │   │   └── venue_matcher.py
 │   └── tools/                     # EPIC-03-08: MCP tool definitions
 │       ├── preferences.py, people.py, search.py, booking.py
-│       ├── history.py, recommendations.py, date_utils.py, error_messages.py
+│       ├── history.py, recommendations.py, date_utils.py
+│       ├── error_messages.py, costs.py
 │
 ├── tests/                         # Mirrors src/ structure exactly (see ENGINEERING-STANDARDS.md)
 │   ├── conftest.py, factories.py
@@ -211,3 +212,12 @@ You: "What should we do for team dinner Thursday?"
 Claude: [Calls search_for_group("work_team", date="Thursday", location="work")]
 → Shows restaurants that work for everyone's dietary needs
 ```
+
+---
+
+## Status
+
+**All 8 EPICs complete.** 945 tests, 100% branch coverage.
+
+Architecture Decision Records:
+- [ADR-001: EPIC-08 Resilience Decisions](../adr/001-epic08-resilience-decisions.md)

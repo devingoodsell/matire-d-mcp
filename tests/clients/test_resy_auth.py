@@ -423,10 +423,11 @@ class TestEnsureValidToken:
         assert result == "new_tok"
         mock_auth.assert_awaited_once_with("a@b.com", "pw")
 
-        # Verify credentials were persisted
+        # Verify credentials were persisted without password
         saved = store.get_credentials("resy")
         assert saved["auth_token"] == "new_tok"
         assert saved["email"] == "a@b.com"
+        assert "password" not in saved
 
     async def test_missing_email_password_raises_auth_error(self, tmp_path):
         store = _make_credential_store(tmp_path)
@@ -436,11 +437,16 @@ class TestEnsureValidToken:
         )
         manager = ResyAuthManager(store)
 
-        with patch.object(
-            manager, "_is_token_valid", new_callable=AsyncMock
-        ) as mock_valid:
+        mock_settings = MagicMock()
+        mock_settings.resy_password = None
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
             mock_valid.return_value = False
-            with pytest.raises(AuthError, match="missing email or password"):
+            with pytest.raises(AuthError, match="Token expired"):
                 await manager.ensure_valid_token()
 
     async def test_empty_auth_token_triggers_refresh(self, tmp_path):
@@ -484,11 +490,11 @@ class TestEnsureValidToken:
             manager, "_is_token_valid", new_callable=AsyncMock
         ) as mock_valid:
             mock_valid.return_value = False
-            with pytest.raises(AuthError, match="missing email or password"):
+            with pytest.raises(AuthError, match="Token expired"):
                 await manager.ensure_valid_token()
 
     async def test_missing_password_with_email_raises_auth_error(self, tmp_path):
-        """Credentials have email but not password."""
+        """Credentials have email but not password — no env var set either."""
         store = _make_credential_store(tmp_path)
         store.save_credentials(
             "resy",
@@ -496,12 +502,196 @@ class TestEnsureValidToken:
         )
         manager = ResyAuthManager(store)
 
-        with patch.object(
-            manager, "_is_token_valid", new_callable=AsyncMock
-        ) as mock_valid:
+        mock_settings = MagicMock()
+        mock_settings.resy_password = None
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
             mock_valid.return_value = False
-            with pytest.raises(AuthError, match="missing email or password"):
+            with pytest.raises(AuthError, match="Token expired"):
                 await manager.ensure_valid_token()
+
+    async def test_config_store_password_used_for_refresh(self, tmp_path):
+        """When password not in stored creds, ConfigStore is checked first."""
+        store = _make_credential_store(tmp_path)
+        store.save_credentials(
+            "resy",
+            {"auth_token": "stale", "api_key": "key", "email": "a@b.com"},
+        )
+        manager = ResyAuthManager(store)
+
+        new_creds = {
+            "auth_token": "cs_tok",
+            "api_key": "new_key",
+            "payment_methods": [],
+        }
+
+        mock_cs = AsyncMock()
+        mock_cs.get = AsyncMock(return_value="config-store-pw")
+
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch.object(
+                manager, "authenticate", new_callable=AsyncMock
+            ) as mock_auth,
+            patch("src.server._config_store", mock_cs),
+        ):
+            mock_valid.return_value = False
+            mock_auth.return_value = new_creds
+            result = await manager.ensure_valid_token()
+
+        assert result == "cs_tok"
+        mock_auth.assert_awaited_once_with("a@b.com", "config-store-pw")
+
+    async def test_config_store_empty_falls_through_to_env(self, tmp_path):
+        """When ConfigStore returns empty, falls through to env var."""
+        store = _make_credential_store(tmp_path)
+        store.save_credentials(
+            "resy",
+            {"auth_token": "stale", "api_key": "key", "email": "a@b.com"},
+        )
+        manager = ResyAuthManager(store)
+
+        new_creds = {
+            "auth_token": "env_tok",
+            "api_key": "new_key",
+            "payment_methods": [],
+        }
+
+        mock_cs = AsyncMock()
+        mock_cs.get = AsyncMock(return_value="")
+
+        mock_settings = MagicMock()
+        mock_settings.resy_password = "env-pw"
+
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch.object(
+                manager, "authenticate", new_callable=AsyncMock
+            ) as mock_auth,
+            patch("src.server._config_store", mock_cs),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            mock_valid.return_value = False
+            mock_auth.return_value = new_creds
+            result = await manager.ensure_valid_token()
+
+        assert result == "env_tok"
+        mock_auth.assert_awaited_once_with("a@b.com", "env-pw")
+
+    async def test_no_config_store_falls_through_to_env(self, tmp_path):
+        """When _config_store is None, falls through to env var."""
+        store = _make_credential_store(tmp_path)
+        store.save_credentials(
+            "resy",
+            {"auth_token": "stale", "api_key": "key", "email": "a@b.com"},
+        )
+        manager = ResyAuthManager(store)
+
+        new_creds = {
+            "auth_token": "nocsenv_tok",
+            "api_key": "new_key",
+            "payment_methods": [],
+        }
+        mock_settings = MagicMock()
+        mock_settings.resy_password = "env-pw"
+
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch.object(
+                manager, "authenticate", new_callable=AsyncMock
+            ) as mock_auth,
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            mock_valid.return_value = False
+            mock_auth.return_value = new_creds
+            result = await manager.ensure_valid_token()
+
+        assert result == "nocsenv_tok"
+        mock_auth.assert_awaited_once_with("a@b.com", "env-pw")
+
+    async def test_env_var_password_used_for_refresh(self, tmp_path):
+        """When password not in stored creds, env var RESY_PASSWORD is used."""
+        store = _make_credential_store(tmp_path)
+        store.save_credentials(
+            "resy",
+            {"auth_token": "stale", "api_key": "key", "email": "a@b.com"},
+        )
+        manager = ResyAuthManager(store)
+
+        new_creds = {
+            "auth_token": "refreshed_tok",
+            "api_key": "new_key",
+            "payment_methods": [],
+        }
+        mock_settings = MagicMock()
+        mock_settings.resy_password = "env-pw"
+
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch.object(
+                manager, "authenticate", new_callable=AsyncMock
+            ) as mock_auth,
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            mock_valid.return_value = False
+            mock_auth.return_value = new_creds
+            result = await manager.ensure_valid_token()
+
+        assert result == "refreshed_tok"
+        mock_auth.assert_awaited_once_with("a@b.com", "env-pw")
+
+        # Verify refreshed creds do not contain password
+        saved = store.get_credentials("resy")
+        assert "password" not in saved
+        assert saved["auth_token"] == "refreshed_tok"
+
+    async def test_refreshed_creds_do_not_contain_password(self, tmp_path):
+        """After token refresh, the saved blob must not contain a password."""
+        store = _make_credential_store(tmp_path)
+        store.save_credentials(
+            "resy",
+            {
+                "auth_token": "old",
+                "api_key": "key",
+                "email": "a@b.com",
+                "password": "legacy-pw",
+            },
+        )
+        manager = ResyAuthManager(store)
+
+        new_creds = {
+            "auth_token": "new_tok",
+            "api_key": "new_key",
+            "payment_methods": [],
+        }
+
+        with (
+            patch.object(
+                manager, "_is_token_valid", new_callable=AsyncMock
+            ) as mock_valid,
+            patch.object(
+                manager, "authenticate", new_callable=AsyncMock
+            ) as mock_auth,
+        ):
+            mock_valid.return_value = False
+            mock_auth.return_value = new_creds
+            await manager.ensure_valid_token()
+
+        saved = store.get_credentials("resy")
+        assert "password" not in saved
 
 
 # ── _is_token_valid ──────────────────────────────────────────────────────────

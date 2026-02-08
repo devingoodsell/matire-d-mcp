@@ -6,11 +6,13 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from src.storage.config_store import ConfigStore
 from src.storage.database import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
 _db: DatabaseManager | None = None
+_config_store: ConfigStore | None = None
 
 
 def get_db() -> DatabaseManager:
@@ -20,25 +22,59 @@ def get_db() -> DatabaseManager:
     return _db
 
 
+def get_config_store() -> ConfigStore | None:
+    """Return the ConfigStore if running in master-key mode, else ``None``."""
+    return _config_store
+
+
 def _reset_db() -> None:
     """Clear the module-level DB reference. Used in tests."""
     global _db  # noqa: PLW0603
     _db = None
 
 
+def _reset_config_store() -> None:
+    """Clear the module-level ConfigStore reference. Used in tests."""
+    global _config_store  # noqa: PLW0603
+    _config_store = None
+
+
+async def resolve_credential(key: str) -> str | None:
+    """Look up a credential from ConfigStore (master-key mode), falling back to Settings.
+
+    Used by all tool modules that need API keys or passwords that may be
+    stored in the encrypted database.
+    """
+    if _config_store is not None:
+        value = await _config_store.get(key)
+        if value:
+            return value
+
+    from src.config import get_settings
+
+    return getattr(get_settings(), key, None)
+
+
 @asynccontextmanager
 async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
     """Manage async resources (database) for the server lifecycle."""
-    global _db  # noqa: PLW0603
+    global _db, _config_store  # noqa: PLW0603
     from src.config import get_settings
 
     settings = get_settings()
     _db = DatabaseManager(settings.db_path)
     await _db.initialize()
     logger.info("Database initialized")
+
+    # Master-key mode: initialise ConfigStore so tools can read encrypted config
+    if settings.uses_master_key and _db.connection is not None:
+        _config_store = ConfigStore(_db.connection, settings.restaurant_mcp_key)  # type: ignore[arg-type]
+        logger.info("ConfigStore initialized (master-key mode)")
+
     try:
         yield {"db": _db}
     finally:
+        _config_store = None
         await _db.close()
         _db = None
         logger.info("Database closed")
@@ -102,6 +138,7 @@ def initialize() -> FastMCP:
     # Register tools
     from src.tools.blacklist import register_blacklist_tools
     from src.tools.booking import register_booking_tools
+    from src.tools.costs import register_cost_tools
     from src.tools.groups import register_group_tools
     from src.tools.history import register_history_tools
     from src.tools.people import register_people_tools
@@ -117,6 +154,7 @@ def initialize() -> FastMCP:
     register_booking_tools(mcp)
     register_history_tools(mcp)
     register_recommendation_tools(mcp)
+    register_cost_tools(mcp)
 
     logger.info("Restaurant MCP server initialized")
     return mcp

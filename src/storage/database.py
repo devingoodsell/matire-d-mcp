@@ -440,6 +440,35 @@ class DatabaseManager:
             (resy_id, opentable_id, place_id),
         )
 
+    async def get_platform_cache_age_hours(self, place_id: str) -> float | None:
+        """Return hours since updated_at for a cached restaurant, or None."""
+        row = await self.fetch_one(
+            """SELECT (julianday('now') - julianday(updated_at)) * 24 AS age_hours
+               FROM restaurant_cache WHERE id = ?""",
+            (place_id,),
+        )
+        if row is None:
+            return None
+        return row["age_hours"]
+
+    async def update_resy_venue_id(self, place_id: str, resy_id: str) -> None:
+        """Update only the resy_venue_id field (empty string = not on Resy)."""
+        await self.execute(
+            """UPDATE restaurant_cache
+               SET resy_venue_id = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (resy_id, place_id),
+        )
+
+    async def update_opentable_id(self, place_id: str, opentable_id: str) -> None:
+        """Update only the opentable_id field (empty string = not on OpenTable)."""
+        await self.execute(
+            """UPDATE restaurant_cache
+               SET opentable_id = ?, updated_at = CURRENT_TIMESTAMP
+               WHERE id = ?""",
+            (opentable_id, place_id),
+        )
+
     # ── Visits & Reviews ──────────────────────────────────────────────────
 
     def _row_to_visit(self, row: dict) -> Visit:
@@ -729,3 +758,30 @@ class DatabaseManager:
             (f"-{days} days",),
         )
         return {r["provider"]: r["total_cents"] for r in rows}
+
+    async def get_api_call_stats(self, days: int = 30) -> list[dict]:
+        """Return per-provider API usage stats for the last *days* days.
+
+        Returns:
+            List of dicts with provider, total_calls, cached_calls, total_cost_cents.
+        """
+        rows = await self.fetch_all(
+            """SELECT provider,
+                      COUNT(*) as total_calls,
+                      SUM(CASE WHEN cached THEN 1 ELSE 0 END) as cached_calls,
+                      SUM(cost_cents) as total_cost_cents
+               FROM api_calls
+               WHERE created_at >= datetime('now', ?)
+               GROUP BY provider
+               ORDER BY total_cost_cents DESC""",
+            (f"-{days} days",),
+        )
+        return [
+            {
+                "provider": r["provider"],
+                "total_calls": r["total_calls"],
+                "cached_calls": r["cached_calls"],
+                "total_cost_cents": r["total_cost_cents"],
+            }
+            for r in rows
+        ]

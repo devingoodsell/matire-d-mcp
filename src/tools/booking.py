@@ -4,7 +4,7 @@ import logging
 
 from fastmcp import FastMCP
 
-from src.server import get_db
+from src.server import get_db, resolve_credential
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +25,56 @@ def _get_auth_manager() -> "ResyAuthManager":  # noqa: F821
     return ResyAuthManager(_get_credential_store())
 
 
+async def _ensure_resy_credentials() -> dict | None:
+    """Get Resy credentials, auto-authenticating from ConfigStore if needed."""
+    store = _get_credential_store()
+    creds = store.get_credentials("resy")
+    if creds:
+        return creds
+
+    # Master-key mode: try to auto-authenticate from ConfigStore
+    from src.clients.resy_auth import AuthError
+
+    email = await resolve_credential("resy_email")
+    password = await resolve_credential("resy_password")
+    if not email or not password:
+        return None
+
+    auth_mgr = _get_auth_manager()
+    try:
+        result = await auth_mgr.authenticate(email, password)
+    except (AuthError, Exception):  # noqa: BLE001
+        logger.warning("Resy auto-auth from ConfigStore failed")
+        return None
+
+    creds = {
+        "email": email,
+        "auth_token": result["auth_token"],
+        "api_key": result["api_key"],
+        "payment_methods": result.get("payment_methods", []),
+    }
+    store.save_credentials("resy", creds)
+    return creds
+
+
+async def _ensure_opentable_credentials() -> dict | None:
+    """Get OpenTable credentials, resolving from ConfigStore/env vars if needed."""
+    store = _get_credential_store()
+    creds = store.get_credentials("opentable")
+    if creds:
+        return creds
+
+    # Master-key mode: resolve from ConfigStore / env vars
+    email = await resolve_credential("opentable_email")
+    password = await resolve_credential("opentable_password")
+    if not email or not password:
+        return None
+
+    creds = {"email": email, "password": password}
+    store.save_credentials("opentable", creds)
+    return creds
+
+
 def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
     """Register booking management tools on the MCP server."""
 
@@ -32,22 +82,36 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
     @mcp.tool
     async def store_resy_credentials(
-        email: str,
-        password: str,
+        email: str | None = None,
+        password: str | None = None,
     ) -> str:
         """Save your Resy account credentials for automated booking.
+
+        **Recommended:** Set RESY_EMAIL and RESY_PASSWORD as environment
+        variables (or in your .env file) so credentials never appear in chat
+        history. If env vars are set, call this tool with no arguments.
+
         Credentials are encrypted and stored locally — never sent
         anywhere except to Resy's own servers for authentication.
+        The password is NOT persisted after authentication.
 
         Args:
-            email: Your Resy account email.
-            password: Your Resy account password.
+            email: Your Resy account email (or set RESY_EMAIL env var).
+            password: Your Resy account password (or set RESY_PASSWORD env var).
 
         Returns:
             Confirmation that credentials were saved and verified,
             or an error if login failed.
         """
         from src.clients.resy_auth import AuthError
+
+        email = email or await resolve_credential("resy_email")
+        password = password or await resolve_credential("resy_password")
+        if not email or not password:
+            return (
+                "Missing credentials. Set RESY_EMAIL and RESY_PASSWORD env vars, "
+                "or pass them as arguments."
+            )
 
         store = _get_credential_store()
         auth_mgr = _get_auth_manager()
@@ -59,7 +123,6 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
         creds = {
             "email": email,
-            "password": password,
             "auth_token": result["auth_token"],
             "api_key": result["api_key"],
             "payment_methods": result.get("payment_methods", []),
@@ -73,24 +136,38 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
     @mcp.tool
     async def store_opentable_credentials(
-        email: str,
-        password: str,
+        email: str | None = None,
+        password: str | None = None,
     ) -> str:
         """Save your OpenTable account credentials for automated booking.
+
+        **Recommended:** Set OPENTABLE_EMAIL and OPENTABLE_PASSWORD as
+        environment variables (or in your .env file) so credentials never
+        appear in chat history. If env vars are set, call this tool with
+        no arguments.
+
         Credentials are encrypted and stored locally.
 
         After saving, the system will verify the credentials work
         by attempting a test login.
 
         Args:
-            email: Your OpenTable account email.
-            password: Your OpenTable account password.
+            email: Your OpenTable account email (or set OPENTABLE_EMAIL env var).
+            password: Your OpenTable account password (or set OPENTABLE_PASSWORD env var).
 
         Returns:
             Confirmation that credentials were saved and verified.
         """
         from src.clients.opentable import OpenTableClient
         from src.clients.resy_auth import AuthError
+
+        email = email or await resolve_credential("opentable_email")
+        password = password or await resolve_credential("opentable_password")
+        if not email or not password:
+            return (
+                "Missing credentials. Set OPENTABLE_EMAIL and OPENTABLE_PASSWORD env vars, "
+                "or pass them as arguments."
+            )
 
         store = _get_credential_store()
 
@@ -159,8 +236,8 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
         all_slots = []
 
         # ── Check Resy ──
+        resy_creds = await _ensure_resy_credentials()
         store = _get_credential_store()
-        resy_creds = store.get_credentials("resy")
         venue_id = restaurant.resy_venue_id
 
         if resy_creds:
@@ -170,7 +247,7 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
                 api_key = resy_creds.get("api_key", "")
                 resy_client = ResyClient(api_key=api_key, auth_token=token)
 
-                if not venue_id:
+                if venue_id is None:
                     matcher = VenueMatcher(db=db, resy_client=resy_client)
                     venue_id = await matcher.find_resy_venue(restaurant)
 
@@ -184,7 +261,7 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
         # ── Check OpenTable ──
         ot_slug = restaurant.opentable_id
-        if not ot_slug:
+        if ot_slug is None:
             matcher = VenueMatcher(db=db)
             ot_slug = await matcher.find_opentable_slug(restaurant)
 
@@ -271,11 +348,12 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
         restaurant = cached[0]
 
         normalised_time = _normalise_time(time)
+        resy_creds = await _ensure_resy_credentials()
         store = _get_credential_store()
 
         # ── Try Resy first ──
-        resy_creds = store.get_credentials("resy")
         venue_id = restaurant.resy_venue_id
+        resy_available_times: list[str] = []
 
         if resy_creds:
             auth_mgr = _get_auth_manager()
@@ -284,28 +362,38 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
                 api_key = resy_creds.get("api_key", "")
                 resy_client = ResyClient(api_key=api_key, auth_token=token)
 
-                if not venue_id:
+                if venue_id is None:
                     matcher = VenueMatcher(db=db, resy_client=resy_client)
                     venue_id = await matcher.find_resy_venue(restaurant)
 
                 if venue_id:
-                    result = await _book_via_resy(
+                    result, resy_available_times = await _book_via_resy(
                         resy_client, db, restaurant, venue_id,
                         parsed_date, normalised_time, party_size,
                         special_requests, resy_creds,
                     )
                     if result:
-                        return result
+                        from src.clients.calendar import generate_gcal_link
+
+                        cal_link = generate_gcal_link(
+                            restaurant_name=restaurant.name,
+                            restaurant_address=restaurant.address,
+                            date=parsed_date,
+                            time=normalised_time,
+                            party_size=party_size,
+                            platform="Resy",
+                        )
+                        return f"{result}\nAdd to calendar: {cal_link}"
             except AuthError:
                 logger.warning("Resy auth failed during booking")
 
         # ── Try OpenTable ──
         ot_slug = restaurant.opentable_id
-        if not ot_slug:
+        if ot_slug is None:
             matcher = VenueMatcher(db=db)
             ot_slug = await matcher.find_opentable_slug(restaurant)
 
-        if ot_slug:
+        if ot_slug and await _ensure_opentable_credentials():
             from src.clients.opentable import OpenTableClient
 
             ot_client = OpenTableClient(credential_store=store)
@@ -330,11 +418,26 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
                         special_requests=special_requests,
                     )
                     await db.save_reservation(reservation)
+
+                    from src.clients.calendar import generate_gcal_link
+
+                    cal_link = generate_gcal_link(
+                        restaurant_name=restaurant.name,
+                        restaurant_address=restaurant.address,
+                        date=parsed_date,
+                        time=normalised_time,
+                        party_size=party_size,
+                        confirmation_id=str(conf),
+                        platform="OpenTable",
+                    )
                     return (
                         f"Booked! {restaurant.name}, {parsed_date} at "
                         f"{_format_time(normalised_time)}, party of {party_size}.\n"
-                        f"Confirmation: {conf} (OpenTable)"
+                        f"Confirmation: {conf} (OpenTable)\n"
+                        f"Add to calendar: {cal_link}"
                     )
+            except AuthError:
+                logger.warning("OpenTable login failed during booking")
             finally:
                 await ot_client.close()
 
@@ -352,13 +455,25 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             )
         if links:
             link_text = "\n".join(links)
-            return (
+            msg = (
                 f"Could not complete booking automatically for {restaurant.name}.\n"
-                f"Try booking directly:\n{link_text}"
             )
-        return (
-            f"'{restaurant.name}' doesn't appear to be on Resy or OpenTable."
-        )
+            if resy_available_times:
+                formatted = ", ".join(
+                    _format_time(t) for t in resy_available_times
+                )
+                msg += (
+                    f"{_format_time(normalised_time)} is not available on Resy. "
+                    f"Available times: {formatted}\n"
+                )
+            msg += f"Try booking directly:\n{link_text}"
+            if restaurant.website:
+                msg += f"\nRestaurant website: {restaurant.website}"
+            return msg
+        msg = f"'{restaurant.name}' doesn't appear to be on Resy or OpenTable."
+        if restaurant.website:
+            msg += f"\nTry their website: {restaurant.website}"
+        return msg
 
     # ── Cancellation ───────────────────────────────────────────────────
 
@@ -424,13 +539,16 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             return f"Cancelled reservation at {res.restaurant_name} on {res.date}."
 
         # Default: Resy
+        resy_creds = await _ensure_resy_credentials()
+        if not resy_creds:
+            return "Resy credentials not available. Store them first."
+
         auth_mgr = _get_auth_manager()
         try:
             token = await auth_mgr.ensure_valid_token()
         except AuthError as exc:
             return f"Resy auth error: {exc}"
 
-        resy_creds = store.get_credentials("resy") or {}
         api_key = resy_creds.get("api_key", "")
 
         resy_client = ResyClient(api_key=api_key, auth_token=token)
@@ -484,17 +602,28 @@ async def _book_via_resy(
     party_size: int,
     special_requests: str | None,
     creds: dict,
-) -> str | None:
-    """Attempt to book via Resy. Returns confirmation string or None on failure."""
+) -> tuple[str | None, list[str]]:
+    """Attempt to book via Resy.
+
+    Returns:
+        Tuple of (confirmation_string_or_None, available_times).
+        available_times is populated when slots exist but the requested
+        time doesn't match, so the caller can inform the user.
+    """
     from src.models.enums import BookingPlatform
     from src.models.reservation import Reservation
 
     slots = await resy_client.find_availability(  # type: ignore[union-attr]
         venue_id=venue_id, date=parsed_date, party_size=party_size
     )
+    available = [s.time for s in slots]
     matching = [s for s in slots if s.time == normalised_time]
     if not matching:
-        return None
+        logger.warning(
+            "Resy: no slot at %s for venue %s on %s (available: %s)",
+            normalised_time, venue_id, parsed_date, available,
+        )
+        return None, available
 
     slot = matching[0]
 
@@ -505,17 +634,22 @@ async def _book_via_resy(
     )
     book_token = details.get("book_token", {}).get("value", "")
     if not book_token:
-        return None
+        logger.warning("Resy: no book_token returned for venue %s", venue_id)
+        return None, available
 
     payment = creds.get("payment_methods")
-    payment_dict = (
-        {"id": payment} if isinstance(payment, (str, int)) else None
-    )
+    if isinstance(payment, list) and payment:
+        payment_dict = payment[0] if isinstance(payment[0], dict) else {"id": payment[0]}
+    elif isinstance(payment, (str, int)):
+        payment_dict = {"id": payment}
+    else:
+        payment_dict = None
     result = await resy_client.book(  # type: ignore[union-attr]
         book_token=book_token, payment_method=payment_dict
     )
     if "error" in result:
-        return None
+        logger.warning("Resy: booking failed: %s", result["error"])
+        return None, available
 
     confirmation_id = result.get("resy_token", result.get("reservation_id", ""))
     reservation = Reservation(
@@ -533,7 +667,8 @@ async def _book_via_resy(
     return (
         f"Booked! {restaurant.name}, {parsed_date} at "  # type: ignore[union-attr]
         f"{_format_time(normalised_time)}, party of {party_size}.\n"
-        f"Confirmation: {confirmation_id}"
+        f"Confirmation: {confirmation_id}",
+        available,
     )
 
 

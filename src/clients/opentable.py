@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import random
+import urllib.parse
 
 from src.clients.resy_auth import AuthError
 from src.models.enums import BookingPlatform
@@ -17,12 +18,29 @@ _USER_AGENT = (
 )
 
 # CSS selectors — constants for easy updates when OpenTable redesigns
-SEL_TIME_SLOT = '[data-test="time-slot"]'
+SEL_TIME_SLOT = 'li[data-testid^="time-slot-"]'
 SEL_SPECIAL_REQUESTS = 'textarea[data-test="special-requests"]'
 SEL_COMPLETE_BUTTON = 'button[data-test="complete-reservation"]'
 SEL_CONFIRMATION = '[data-test="confirmation-number"]'
 SEL_CANCEL_BUTTON = 'button[data-test="cancel-reservation"]'
 SEL_CONFIRM_CANCEL = 'button[data-test="confirm-cancel"]'
+
+# Anti-detection init script
+_STEALTH_SCRIPT = """
+    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+"""
+
+
+def _build_restaurant_url(
+    base: str, slug: str, date: str, party_size: int, time: str,
+) -> str:
+    """Build an OpenTable restaurant URL with correct query params.
+
+    OpenTable expects: ``/r/{slug}?covers=N&dateTime=YYYY-MM-DDTHH:MM``
+    """
+    date_time = f"{date}T{time}"
+    params = urllib.parse.urlencode({"covers": party_size, "dateTime": date_time})
+    return f"{base}/r/{slug}?{params}"
 
 
 class OpenTableClient:
@@ -59,12 +77,16 @@ class OpenTableClient:
             ) from exc
 
         self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(headless=True)  # type: ignore[union-attr]
+        self._browser = await self._pw.chromium.launch(  # type: ignore[union-attr]
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
         self._context = await self._browser.new_context(  # type: ignore[union-attr]
             user_agent=_USER_AGENT,
             viewport={"width": 1280, "height": 720},
             locale="en-US",
         )
+        await self._context.add_init_script(_STEALTH_SCRIPT)  # type: ignore[union-attr]
         self._page = await self._context.new_page()  # type: ignore[union-attr]
 
     async def close(self) -> None:
@@ -101,7 +123,7 @@ class OpenTableClient:
 
         try:
             await page.goto(  # type: ignore[union-attr]
-                f"{self.BASE_URL}/sign-in", wait_until="networkidle"
+                f"{self.BASE_URL}/sign-in", wait_until="domcontentloaded"
             )
             await self._random_delay(1, 3)
 
@@ -116,7 +138,7 @@ class OpenTableClient:
             await self._random_delay(0.5, 1)
 
             await page.click('button[type="submit"]')  # type: ignore[union-attr]
-            await page.wait_for_load_state("networkidle")  # type: ignore[union-attr]
+            await page.wait_for_load_state("domcontentloaded")  # type: ignore[union-attr]
 
             self._logged_in = True
         except Exception as exc:
@@ -135,7 +157,7 @@ class OpenTableClient:
             restaurant_slug: OpenTable slug, e.g. "carbone-new-york".
             date: Date string YYYY-MM-DD.
             party_size: Number of diners.
-            preferred_time: Center time for availability window.
+            preferred_time: Center time for availability window (HH:MM, 24h).
 
         Returns:
             List of available TimeSlot objects.
@@ -143,17 +165,16 @@ class OpenTableClient:
         await self._ensure_browser()
         page = self._page
 
-        url = (
-            f"{self.BASE_URL}/r/{restaurant_slug}"
-            f"?date={date}&party_size={party_size}&time={preferred_time}"
+        url = _build_restaurant_url(
+            self.BASE_URL, restaurant_slug, date, party_size, preferred_time,
         )
 
         try:
-            await page.goto(url, wait_until="networkidle")  # type: ignore[union-attr]
-            await self._random_delay(2, 4)
+            await page.goto(url, wait_until="domcontentloaded")  # type: ignore[union-attr]
+            await self._random_delay(3, 5)
 
             await page.wait_for_selector(  # type: ignore[union-attr]
-                SEL_TIME_SLOT, timeout=10000
+                SEL_TIME_SLOT, timeout=15000
             )
 
             elements = await page.query_selector_all(  # type: ignore[union-attr]
@@ -162,6 +183,9 @@ class OpenTableClient:
             slots: list[TimeSlot] = []
             for el in elements:
                 time_text = await el.inner_text()
+                time_text = time_text.strip()
+                if not time_text:
+                    continue
                 slots.append(
                     TimeSlot(
                         time=self._parse_time(time_text),
@@ -187,7 +211,7 @@ class OpenTableClient:
         Args:
             restaurant_slug: OpenTable slug.
             date: Date YYYY-MM-DD.
-            time: Time HH:MM.
+            time: Time HH:MM (24h).
             party_size: Number of diners.
             special_requests: Optional special requests text.
 
@@ -198,18 +222,17 @@ class OpenTableClient:
             await self._login()
 
         page = self._page
-        url = (
-            f"{self.BASE_URL}/r/{restaurant_slug}"
-            f"?date={date}&party_size={party_size}&time={time}"
+        url = _build_restaurant_url(
+            self.BASE_URL, restaurant_slug, date, party_size, time,
         )
 
         try:
-            await page.goto(url, wait_until="networkidle")  # type: ignore[union-attr]
-            await self._random_delay(2, 4)
+            await page.goto(url, wait_until="domcontentloaded")  # type: ignore[union-attr]
+            await self._random_delay(3, 5)
 
             # Click the desired time slot
             await page.wait_for_selector(  # type: ignore[union-attr]
-                SEL_TIME_SLOT, timeout=10000
+                SEL_TIME_SLOT, timeout=15000
             )
             slot_els = await page.query_selector_all(  # type: ignore[union-attr]
                 SEL_TIME_SLOT
@@ -262,7 +285,7 @@ class OpenTableClient:
         try:
             await page.goto(  # type: ignore[union-attr]
                 f"{self.BASE_URL}/my/reservations",
-                wait_until="networkidle",
+                wait_until="domcontentloaded",
             )
             await self._random_delay(2, 3)
 

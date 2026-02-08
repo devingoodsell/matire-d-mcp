@@ -5,7 +5,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Application configuration loaded from environment variables and .env file."""
+    """Application configuration loaded from environment variables and .env file.
+
+    Two modes of operation:
+
+    1. **Legacy (.env) mode** — ``GOOGLE_API_KEY`` is required as an env var.
+    2. **Master-key mode** — set ``RESTAURANT_MCP_KEY`` and all API keys /
+       credentials are loaded from the encrypted ``app_config`` table at
+       runtime (``google_api_key`` may be empty at construction time).
+    """
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -13,22 +21,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # Required
-    google_api_key: str
+    # Master key — when set, credentials come from the encrypted DB
+    restaurant_mcp_key: str | None = None
+
+    # Required in legacy mode, loaded from DB in master-key mode
+    google_api_key: str = ""
 
     # Optional — weather-aware recommendations
     openweather_api_key: str | None = None
 
-    # Optional — Resy credentials (can be set up via MCP tool)
+    # Optional — booking platform credentials (prefer env vars over chat input)
     resy_email: str | None = None
     resy_password: str | None = None
-
-    # Optional — OpenTable credentials
     opentable_email: str | None = None
     opentable_password: str | None = None
 
-    # Paths & logging
-    data_dir: Path = Path("./data")
+    # Paths & logging — default is <project_root>/data so it works
+    # regardless of the process working directory (Claude Desktop may
+    # spawn the server from a read-only location).
+    data_dir: Path = Path(__file__).resolve().parent.parent / "data"
     log_level: str = "INFO"
 
     @computed_field  # type: ignore[prop-decorator]
@@ -40,6 +51,11 @@ class Settings(BaseSettings):
     @property
     def credentials_path(self) -> Path:
         return self.data_dir / ".credentials"
+
+    @property
+    def uses_master_key(self) -> bool:
+        """Return True when running in master-key (encrypted DB) mode."""
+        return bool(self.restaurant_mcp_key)
 
 
 _settings: Settings | None = None

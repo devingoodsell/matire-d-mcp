@@ -149,6 +149,12 @@ CREATE TABLE IF NOT EXISTS api_calls (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Encrypted application config (master key mode)
+CREATE TABLE IF NOT EXISTS app_config (
+    key   TEXT PRIMARY KEY,
+    value BLOB NOT NULL
+);
+
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_visits_restaurant ON visits(restaurant_id);
 CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(date);

@@ -39,6 +39,26 @@ def _slugify(name: str) -> str:
     return slug
 
 
+# Phrases on OpenTable pages that indicate the restaurant is NOT bookable
+_NOT_BOOKABLE_PHRASES = [
+    "not on the opentable booking network",
+    "not on the opentable reservation network",
+    "not available on opentable",
+]
+
+
+def _is_bookable_page(html: str) -> bool:
+    """Return True if the OpenTable page is for a bookable restaurant.
+
+    OpenTable returns HTTP 200 for restaurants that have a listing page but
+    are not actually bookable. These pages contain phrases like "not on the
+    OpenTable booking network". We reject those pages so they are not
+    incorrectly treated as valid OpenTable venues.
+    """
+    lower = html.lower()
+    return not any(phrase in lower for phrase in _NOT_BOOKABLE_PHRASES)
+
+
 def generate_resy_deep_link(
     venue_id: str, date: str, party_size: int
 ) -> str:
@@ -52,8 +72,11 @@ def generate_opentable_deep_link(
     """Generate an OpenTable booking deep link."""
     return (
         f"https://www.opentable.com/r/{slug}"
-        f"?date={date}&time={time}&party_size={party_size}"
+        f"?covers={party_size}&dateTime={date}T{time}"
     )
+
+
+_NEGATIVE_CACHE_TTL_HOURS = 168  # 7 days
 
 
 class VenueMatcher:
@@ -75,7 +98,10 @@ class VenueMatcher:
         1. Check cache for existing resy_venue_id
         2. Search Resy by name + location
         3. Fuzzy-match name and address
-        4. Cache the result
+        4. Cache the result (positive or negative)
+
+        Uses ``""`` (empty string) as a sentinel for "checked, not found"
+        vs ``None`` for "never checked".
 
         Returns:
             Resy venue_id string, or None if not on Resy.
@@ -83,16 +109,21 @@ class VenueMatcher:
         if not self.resy_client:
             return None
 
-        # 1. Cache check
+        # 1. Cache check: "" means "already checked, not on Resy"
         cached = await self.db.get_cached_restaurant(restaurant.id)
-        if cached and cached.resy_venue_id:
-            return cached.resy_venue_id
+        if cached and cached.resy_venue_id is not None:
+            if cached.resy_venue_id != "":
+                return cached.resy_venue_id  # positive cache — always trust
+            # Negative cache — check TTL
+            age = await self.db.get_platform_cache_age_hours(restaurant.id)
+            if age is not None and age < _NEGATIVE_CACHE_TTL_HOURS:
+                return None  # still fresh, skip
+            # else: expired, fall through to re-check
 
         # 2. Search Resy
-        hits = await self.resy_client.search_venue(
-            restaurant.name, restaurant.lat, restaurant.lng
-        )
+        hits = await self.resy_client.search_venue(restaurant.name)
         if not hits:
+            await self.db.update_resy_venue_id(restaurant.id, "")
             return None
 
         # 3. Fuzzy match
@@ -114,12 +145,12 @@ class VenueMatcher:
 
             venue_id = hit.get("id", "")
             if venue_id:
-                # 4. Cache result
-                await self.db.update_platform_ids(
-                    restaurant.id, resy_id=venue_id, opentable_id=None
-                )
+                # 4. Cache positive result
+                await self.db.update_resy_venue_id(restaurant.id, venue_id)
                 return venue_id
 
+        # Cache negative result
+        await self.db.update_resy_venue_id(restaurant.id, "")
         return None
 
     async def find_opentable_slug(self, restaurant: Restaurant) -> str | None:
@@ -127,16 +158,26 @@ class VenueMatcher:
 
         Strategy:
         1. Check cache for existing opentable_id
-        2. Try common slug patterns with HEAD request
-        3. Cache the result
+        2. Try common slug patterns with GET request
+        3. Verify the page is actually bookable (not just a stub page)
+        4. Cache the result (positive or negative)
+
+        Uses ``""`` (empty string) as a sentinel for "checked, not found"
+        vs ``None`` for "never checked".
 
         Returns:
             OpenTable slug string, or None if not on OpenTable.
         """
-        # 1. Cache check
+        # 1. Cache check: "" means "already checked, not on OpenTable"
         cached = await self.db.get_cached_restaurant(restaurant.id)
-        if cached and cached.opentable_id:
-            return cached.opentable_id
+        if cached and cached.opentable_id is not None:
+            if cached.opentable_id != "":
+                return cached.opentable_id  # positive cache — always trust
+            # Negative cache — check TTL
+            age = await self.db.get_platform_cache_age_hours(restaurant.id)
+            if age is not None and age < _NEGATIVE_CACHE_TTL_HOURS:
+                return None  # still fresh, skip
+            # else: expired, fall through to re-check
 
         # 2. Try slug patterns
         base_slug = _slugify(restaurant.name)
@@ -149,14 +190,16 @@ class VenueMatcher:
             for slug in candidates:
                 url = f"https://www.opentable.com/r/{slug}"
                 try:
-                    response = await client.head(url)
-                    if response.status_code == 200:
-                        # 3. Cache result
-                        await self.db.update_platform_ids(
-                            restaurant.id, resy_id=None, opentable_id=slug
-                        )
+                    response = await client.get(url)
+                    if response.status_code == 200 and _is_bookable_page(
+                        response.text
+                    ):
+                        # 3. Cache positive result
+                        await self.db.update_opentable_id(restaurant.id, slug)
                         return slug
                 except httpx.HTTPError:
                     continue
 
+        # Cache negative result
+        await self.db.update_opentable_id(restaurant.id, "")
         return None

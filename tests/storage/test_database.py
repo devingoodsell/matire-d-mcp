@@ -443,6 +443,28 @@ class TestRestaurantCache:
         stale_ids = await db.get_stale_cache_ids(max_age_hours=24)
         assert stale_ids == []
 
+    async def test_get_platform_cache_age_hours_recent(self, db: DatabaseManager):
+        restaurant = make_restaurant(id="age_fresh", name="Fresh")
+        await db.cache_restaurant(restaurant)
+        age = await db.get_platform_cache_age_hours("age_fresh")
+        assert age is not None
+        assert age < 1.0  # just cached, should be near zero
+
+    async def test_get_platform_cache_age_hours_old(self, db: DatabaseManager):
+        restaurant = make_restaurant(id="age_old", name="Old")
+        await db.cache_restaurant(restaurant)
+        await db.execute(
+            "UPDATE restaurant_cache SET updated_at = datetime('now', '-48 hours') WHERE id = ?",
+            ("age_old",),
+        )
+        age = await db.get_platform_cache_age_hours("age_old")
+        assert age is not None
+        assert age >= 47.0  # roughly 48 hours
+
+    async def test_get_platform_cache_age_hours_missing(self, db: DatabaseManager):
+        age = await db.get_platform_cache_age_hours("nonexistent")
+        assert age is None
+
     async def test_update_platform_ids(self, db: DatabaseManager):
         restaurant = make_restaurant(id="place_plat", name="Platform Test")
         await db.cache_restaurant(restaurant)
@@ -451,6 +473,68 @@ class TestRestaurantCache:
         assert result is not None
         assert result.resy_venue_id == "resy_123"
         assert result.opentable_id == "ot_456"
+
+    async def test_update_resy_venue_id(self, db: DatabaseManager):
+        restaurant = make_restaurant(id="place_resy", name="Resy Only")
+        await db.cache_restaurant(restaurant)
+        await db.update_resy_venue_id("place_resy", "resy_abc")
+        result = await db.get_cached_restaurant("place_resy")
+        assert result is not None
+        assert result.resy_venue_id == "resy_abc"
+        # opentable_id unchanged
+        assert result.opentable_id == restaurant.opentable_id
+
+    async def test_update_resy_venue_id_empty_string(self, db: DatabaseManager):
+        """Empty string sentinel means 'checked, not on Resy'."""
+        restaurant = make_restaurant(id="place_resy_neg", name="Not on Resy")
+        await db.cache_restaurant(restaurant)
+        await db.update_resy_venue_id("place_resy_neg", "")
+        result = await db.get_cached_restaurant("place_resy_neg")
+        assert result is not None
+        assert result.resy_venue_id == ""
+
+    async def test_update_opentable_id(self, db: DatabaseManager):
+        restaurant = make_restaurant(id="place_ot", name="OT Only")
+        await db.cache_restaurant(restaurant)
+        await db.update_opentable_id("place_ot", "ot_xyz")
+        result = await db.get_cached_restaurant("place_ot")
+        assert result is not None
+        assert result.opentable_id == "ot_xyz"
+        # resy_venue_id unchanged
+        assert result.resy_venue_id == restaurant.resy_venue_id
+
+    async def test_update_opentable_id_empty_string(self, db: DatabaseManager):
+        """Empty string sentinel means 'checked, not on OpenTable'."""
+        restaurant = make_restaurant(id="place_ot_neg", name="Not on OT")
+        await db.cache_restaurant(restaurant)
+        await db.update_opentable_id("place_ot_neg", "")
+        result = await db.get_cached_restaurant("place_ot_neg")
+        assert result is not None
+        assert result.opentable_id == ""
+
+    async def test_update_resy_venue_id_does_not_clobber_opentable(self, db: DatabaseManager):
+        """Updating resy_venue_id should not affect opentable_id."""
+        restaurant = make_restaurant(
+            id="place_both", name="Both", opentable_id="ot-existing",
+        )
+        await db.cache_restaurant(restaurant)
+        await db.update_resy_venue_id("place_both", "resy-new")
+        result = await db.get_cached_restaurant("place_both")
+        assert result is not None
+        assert result.resy_venue_id == "resy-new"
+        assert result.opentable_id == "ot-existing"
+
+    async def test_update_opentable_id_does_not_clobber_resy(self, db: DatabaseManager):
+        """Updating opentable_id should not affect resy_venue_id."""
+        restaurant = make_restaurant(
+            id="place_both2", name="Both2", resy_venue_id="resy-existing",
+        )
+        await db.cache_restaurant(restaurant)
+        await db.update_opentable_id("place_both2", "ot-new")
+        result = await db.get_cached_restaurant("place_both2")
+        assert result is not None
+        assert result.opentable_id == "ot-new"
+        assert result.resy_venue_id == "resy-existing"
 
 
 # ── Visits & Reviews ─────────────────────────────────────────────────────────
@@ -759,6 +843,25 @@ class TestAPILogging:
         costs = await db.get_api_costs(days=30)
         assert costs["google"] == 5.0
         assert costs["resy"] == 1.5
+
+    async def test_get_api_call_stats_empty(self, db: DatabaseManager):
+        stats = await db.get_api_call_stats(days=30)
+        assert stats == []
+
+    async def test_get_api_call_stats_aggregates(self, db: DatabaseManager):
+        await db.log_api_call("google", "/places", 3.2, 200, False)
+        await db.log_api_call("google", "/places", 3.2, 200, True)
+        await db.log_api_call("resy", "/venues", 0.0, 200, False)
+        stats = await db.get_api_call_stats(days=30)
+        assert len(stats) == 2
+        google = next(s for s in stats if s["provider"] == "google")
+        assert google["total_calls"] == 2
+        assert google["cached_calls"] == 1
+        assert google["total_cost_cents"] == 6.4
+        resy = next(s for s in stats if s["provider"] == "resy")
+        assert resy["total_calls"] == 1
+        assert resy["cached_calls"] == 0
+        assert resy["total_cost_cents"] == 0.0
 
 
 # ── EPIC-07: get_visit_by_restaurant_name ────────────────────────────────────
