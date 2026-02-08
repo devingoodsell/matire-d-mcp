@@ -36,11 +36,14 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
+markers = [
+    "integration: live API tests (require real credentials)",
+]
 
 [tool.coverage.run]
 source = ["src"]
 branch = true
-omit = ["src/__main__.py"]
+omit = ["src/__main__.py", "tests/integration/*"]
 
 [tool.coverage.report]
 fail_under = 100

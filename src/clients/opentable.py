@@ -1,11 +1,12 @@
-"""OpenTable client using Playwright browser automation."""
+"""OpenTable client using DAPI (frontend HTTP API) — no browser automation."""
 
-import asyncio
+import json
 import logging
-import random
+import re
 import urllib.parse
 
-from src.clients.resy_auth import AuthError
+import httpx
+
 from src.models.enums import BookingPlatform
 from src.models.restaurant import TimeSlot
 from src.storage.credentials import CredentialStore
@@ -17,17 +18,29 @@ _USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
-# CSS selectors — constants for easy updates when OpenTable redesigns
-SEL_TIME_SLOT = 'li[data-testid^="time-slot-"]'
-SEL_SPECIAL_REQUESTS = 'textarea[data-test="special-requests"]'
-SEL_COMPLETE_BUTTON = 'button[data-test="complete-reservation"]'
-SEL_CONFIRMATION = '[data-test="confirmation-number"]'
-SEL_CANCEL_BUTTON = 'button[data-test="cancel-reservation"]'
-SEL_CONFIRM_CANCEL = 'button[data-test="confirm-cancel"]'
-
-# Anti-detection init script
-_STEALTH_SCRIPT = """
-    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+# GraphQL operation for availability
+_AVAILABILITY_QUERY = """
+query RestaurantsAvailability($onlyPop: Boolean, $requestedDate: String!,
+  $requestedTime: String!, $covers: Int!, $restaurantIds: [Int!]!) {
+  availability(
+    onlyPop: $onlyPop
+    requestedDate: $requestedDate
+    requestedTime: $requestedTime
+    covers: $covers
+    restaurantIds: $restaurantIds
+  ) {
+    restaurantId
+    availabilityDays {
+      date
+      slots {
+        dateTime
+        timeString
+        slotAvailabilityToken
+        slotHash
+      }
+    }
+  }
+}
 """
 
 
@@ -44,10 +57,10 @@ def _build_restaurant_url(
 
 
 class OpenTableClient:
-    """Playwright-based OpenTable automation.
+    """HTTP-based OpenTable client using DAPI (frontend API).
 
-    All interactions go through the real OpenTable website with
-    realistic delays to avoid bot detection.
+    Uses the same GraphQL and booking endpoints that the OpenTable
+    website frontend uses, via plain HTTP requests.
 
     Args:
         credential_store: CredentialStore for reading OpenTable credentials.
@@ -57,92 +70,60 @@ class OpenTableClient:
 
     def __init__(self, credential_store: CredentialStore) -> None:
         self.credential_store = credential_store
-        self._browser: object | None = None
-        self._context: object | None = None
-        self._page: object | None = None
-        self._logged_in = False
-        self._pw: object | None = None
+        self._http: httpx.AsyncClient | None = None
+        self._rid_cache: dict[str, int] = {}
 
-    async def _ensure_browser(self) -> None:
-        """Launch browser if not already running."""
-        if self._browser:
-            return
+    def _get_http(self) -> httpx.AsyncClient:
+        """Return (and lazily create) the shared httpx client.
 
-        try:
-            from playwright.async_api import async_playwright
-        except ImportError as exc:
-            raise AuthError(
-                "Playwright is not installed. Run: pip install playwright && "
-                "playwright install chromium"
-            ) from exc
-
-        self._pw = await async_playwright().start()
-        self._browser = await self._pw.chromium.launch(  # type: ignore[union-attr]
-            headless=True,
-            args=["--disable-blink-features=AutomationControlled"],
-        )
-        self._context = await self._browser.new_context(  # type: ignore[union-attr]
-            user_agent=_USER_AGENT,
-            viewport={"width": 1280, "height": 720},
-            locale="en-US",
-        )
-        await self._context.add_init_script(_STEALTH_SCRIPT)  # type: ignore[union-attr]
-        self._page = await self._context.new_page()  # type: ignore[union-attr]
+        If stored credentials contain a ``cookies`` string (raw Cookie
+        header copied from a browser session), it is attached as a
+        default header so that every request carries the authenticated
+        session cookies required to bypass bot protection.
+        """
+        if self._http is None:
+            headers: dict[str, str] = {"User-Agent": _USER_AGENT}
+            creds = self.credential_store.get_credentials("opentable")
+            if creds and creds.get("cookies"):
+                headers["Cookie"] = creds["cookies"]
+            self._http = httpx.AsyncClient(
+                timeout=15.0,
+                follow_redirects=True,
+                headers=headers,
+            )
+        return self._http
 
     async def close(self) -> None:
-        """Close browser and clean up."""
-        if self._browser:
-            await self._browser.close()  # type: ignore[union-attr]
-            self._browser = None
-            self._context = None
-            self._page = None
-            self._logged_in = False
-        if self._pw:
-            await self._pw.stop()  # type: ignore[union-attr]
-            self._pw = None
+        """Close the httpx client."""
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
-    async def _random_delay(
-        self, min_seconds: float = 1.0, max_seconds: float = 3.0
-    ) -> None:
-        """Random delay to mimic human behaviour."""
-        delay = random.uniform(min_seconds, max_seconds)
-        await asyncio.sleep(delay)
+    async def _resolve_restaurant_id(self, slug: str) -> int | None:
+        """Resolve an OpenTable slug to a numeric restaurant ID.
 
-    async def _login(self) -> None:
-        """Login to OpenTable via the website.
+        Fetches the restaurant page and extracts ``rid`` from the
+        embedded data (``data-rid`` attribute or JSON payload).
 
-        Raises:
-            AuthError: If credentials are missing or login fails.
+        Results are cached in memory.
         """
-        creds = self.credential_store.get_credentials("opentable")
-        if not creds:
-            raise AuthError("OpenTable credentials not configured.")
+        if slug in self._rid_cache:
+            return self._rid_cache[slug]
 
-        await self._ensure_browser()
-        page = self._page
-
+        client = self._get_http()
+        url = f"{self.BASE_URL}/r/{slug}"
         try:
-            await page.goto(  # type: ignore[union-attr]
-                f"{self.BASE_URL}/sign-in", wait_until="domcontentloaded"
-            )
-            await self._random_delay(1, 3)
-
-            await page.fill(  # type: ignore[union-attr]
-                'input[name="email"]', creds["email"]
-            )
-            await self._random_delay(0.5, 1.5)
-
-            await page.fill(  # type: ignore[union-attr]
-                'input[name="password"]', creds["password"]
-            )
-            await self._random_delay(0.5, 1)
-
-            await page.click('button[type="submit"]')  # type: ignore[union-attr]
-            await page.wait_for_load_state("domcontentloaded")  # type: ignore[union-attr]
-
-            self._logged_in = True
-        except Exception as exc:
-            raise AuthError(f"OpenTable login failed: {exc}") from exc
+            resp = await client.get(url)
+            if resp.status_code != 200:
+                logger.warning("OT page fetch failed for %s: %s", slug, resp.status_code)
+                return None
+            rid = _extract_rid(resp.text)
+            if rid is not None:
+                self._rid_cache[slug] = rid
+            return rid
+        except httpx.HTTPError as exc:
+            logger.warning("OT page fetch error for %s: %s", slug, exc)
+            return None
 
     async def find_availability(
         self,
@@ -151,7 +132,7 @@ class OpenTableClient:
         party_size: int,
         preferred_time: str = "19:00",
     ) -> list[TimeSlot]:
-        """Check availability by navigating to the restaurant's page.
+        """Check availability via OpenTable DAPI GraphQL.
 
         Args:
             restaurant_slug: OpenTable slug, e.g. "carbone-new-york".
@@ -162,40 +143,37 @@ class OpenTableClient:
         Returns:
             List of available TimeSlot objects.
         """
-        await self._ensure_browser()
-        page = self._page
+        rid = await self._resolve_restaurant_id(restaurant_slug)
+        if rid is None:
+            logger.warning("Could not resolve rid for %s", restaurant_slug)
+            return []
 
-        url = _build_restaurant_url(
-            self.BASE_URL, restaurant_slug, date, party_size, preferred_time,
-        )
+        client = self._get_http()
+        payload = {
+            "operationName": "RestaurantsAvailability",
+            "query": _AVAILABILITY_QUERY,
+            "variables": {
+                "onlyPop": False,
+                "requestedDate": date,
+                "requestedTime": preferred_time,
+                "covers": party_size,
+                "restaurantIds": [rid],
+            },
+        }
 
         try:
-            await page.goto(url, wait_until="domcontentloaded")  # type: ignore[union-attr]
-            await self._random_delay(3, 5)
-
-            await page.wait_for_selector(  # type: ignore[union-attr]
-                SEL_TIME_SLOT, timeout=15000
+            resp = await client.post(
+                f"{self.BASE_URL}/dapi/fe/gql"
+                "?optype=query&opname=RestaurantsAvailability",
+                json=payload,
+                headers={"Content-Type": "application/json"},
             )
-
-            elements = await page.query_selector_all(  # type: ignore[union-attr]
-                SEL_TIME_SLOT
-            )
-            slots: list[TimeSlot] = []
-            for el in elements:
-                time_text = await el.inner_text()
-                time_text = time_text.strip()
-                if not time_text:
-                    continue
-                slots.append(
-                    TimeSlot(
-                        time=self._parse_time(time_text),
-                        platform=BookingPlatform.OPENTABLE,
-                        type=None,
-                    )
-                )
-            return slots
-        except Exception:  # noqa: BLE001
-            logger.warning("OpenTable availability check failed for %s", restaurant_slug)
+            if resp.status_code != 200:
+                logger.warning("OT DAPI availability returned %s", resp.status_code)
+                return []
+            return _parse_availability_response(resp.json())
+        except (httpx.HTTPError, json.JSONDecodeError, KeyError) as exc:
+            logger.warning("OT availability check failed for %s: %s", restaurant_slug, exc)
             return []
 
     async def book(
@@ -204,136 +182,177 @@ class OpenTableClient:
         date: str,
         time: str,
         party_size: int,
+        slot_availability_token: str,
+        slot_hash: str,
         special_requests: str | None = None,
     ) -> dict:
-        """Book a reservation via browser automation.
+        """Book a reservation via DAPI make-reservation endpoint.
+
+        Requires an authenticated CSRF token stored in credentials.
 
         Args:
             restaurant_slug: OpenTable slug.
             date: Date YYYY-MM-DD.
             time: Time HH:MM (24h).
             party_size: Number of diners.
+            slot_availability_token: Token from availability response.
+            slot_hash: Hash from availability response.
             special_requests: Optional special requests text.
 
         Returns:
             Dict with confirmation_number or error.
         """
-        if not self._logged_in:
-            await self._login()
+        creds = self.credential_store.get_credentials("opentable")
+        if not creds or not creds.get("csrf_token"):
+            return {"error": "OpenTable CSRF token not configured. Store credentials first."}
 
-        page = self._page
-        url = _build_restaurant_url(
-            self.BASE_URL, restaurant_slug, date, party_size, time,
-        )
+        rid = await self._resolve_restaurant_id(restaurant_slug)
+        if rid is None:
+            return {"error": f"Could not resolve restaurant ID for {restaurant_slug}"}
+
+        client = self._get_http()
+        booking_payload = {
+            "restaurantId": rid,
+            "slotAvailabilityToken": slot_availability_token,
+            "slotHash": slot_hash,
+            "covers": party_size,
+            "dateTime": f"{date}T{time}",
+            "firstName": creds.get("first_name", ""),
+            "lastName": creds.get("last_name", ""),
+            "email": creds.get("email", ""),
+            "phoneNumber": creds.get("phone", ""),
+        }
+        if special_requests:
+            booking_payload["specialRequests"] = special_requests
 
         try:
-            await page.goto(url, wait_until="domcontentloaded")  # type: ignore[union-attr]
-            await self._random_delay(3, 5)
-
-            # Click the desired time slot
-            await page.wait_for_selector(  # type: ignore[union-attr]
-                SEL_TIME_SLOT, timeout=15000
+            resp = await client.post(
+                f"{self.BASE_URL}/dapi/booking/make-reservation",
+                json=booking_payload,
+                headers={
+                    "Content-Type": "application/json",
+                    "x-csrf-token": creds["csrf_token"],
+                },
             )
-            slot_els = await page.query_selector_all(  # type: ignore[union-attr]
-                SEL_TIME_SLOT
-            )
-            if not slot_els:
-                return {"error": "No time slots found"}
-
-            # Click first available slot
-            await slot_els[0].click()
-            await self._random_delay(2, 3)
-
-            # Fill special requests if provided
-            if special_requests:
-                sr_field = await page.query_selector(  # type: ignore[union-attr]
-                    SEL_SPECIAL_REQUESTS
-                )
-                if sr_field:
-                    await sr_field.fill(special_requests)
-                    await self._random_delay(1, 2)
-
-            # Complete reservation
-            await page.click(SEL_COMPLETE_BUTTON)  # type: ignore[union-attr]
-            await self._random_delay(3, 5)
-
-            # Extract confirmation
-            conf_el = await page.query_selector(  # type: ignore[union-attr]
-                SEL_CONFIRMATION
-            )
-            confirmation = await conf_el.inner_text() if conf_el else ""
-
-            return {"confirmation_number": confirmation}
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("OpenTable booking failed: %s", exc)
+            if resp.status_code != 200:
+                return {"error": f"Booking failed with status {resp.status_code}"}
+            data = resp.json()
+            conf_number = data.get("confirmationNumber", data.get("reservationId", ""))
+            return {"confirmation_number": str(conf_number)}
+        except (httpx.HTTPError, json.JSONDecodeError) as exc:
+            logger.warning("OT booking failed: %s", exc)
             return {"error": str(exc)}
 
     async def cancel(self, confirmation_number: str) -> bool:
-        """Cancel an OpenTable reservation via the website.
+        """Cancel an OpenTable reservation via DAPI.
+
+        Sends a POST to the DAPI cancel-reservation endpoint with the
+        confirmation number and CSRF token.
 
         Args:
             confirmation_number: The reservation confirmation number.
 
         Returns:
-            True if cancellation succeeded.
+            True if cancellation succeeded, False otherwise.
         """
-        if not self._logged_in:
-            await self._login()
-
-        page = self._page
-
-        try:
-            await page.goto(  # type: ignore[union-attr]
-                f"{self.BASE_URL}/my/reservations",
-                wait_until="domcontentloaded",
-            )
-            await self._random_delay(2, 3)
-
-            # Find and click cancel for the specific reservation
-            cancel_btn = await page.query_selector(  # type: ignore[union-attr]
-                SEL_CANCEL_BUTTON
-            )
-            if not cancel_btn:
-                logger.warning("Cancel button not found for %s", confirmation_number)
-                return False
-
-            await cancel_btn.click()
-            await self._random_delay(1, 2)
-
-            # Confirm cancellation
-            confirm_btn = await page.query_selector(  # type: ignore[union-attr]
-                SEL_CONFIRM_CANCEL
-            )
-            if confirm_btn:
-                await confirm_btn.click()
-                await self._random_delay(2, 3)
-
-            return True
-        except Exception:  # noqa: BLE001
-            logger.warning("OpenTable cancellation failed for %s", confirmation_number)
+        creds = self.credential_store.get_credentials("opentable")
+        if not creds or not creds.get("csrf_token"):
+            logger.warning("Cannot cancel: OpenTable CSRF token not configured")
             return False
 
-    @staticmethod
-    def _parse_time(text: str) -> str:
-        """Parse time text from the page into HH:MM format.
+        client = self._get_http()
+        try:
+            resp = await client.post(
+                f"{self.BASE_URL}/dapi/booking/cancel-reservation",
+                json={"confirmationNumber": confirmation_number},
+                headers={
+                    "Content-Type": "application/json",
+                    "x-csrf-token": creds["csrf_token"],
+                },
+            )
+            if resp.status_code == 200:
+                return True
+            logger.warning(
+                "OT cancel returned %s for %s", resp.status_code, confirmation_number,
+            )
+            return False
+        except httpx.HTTPError as exc:
+            logger.warning("OT cancel failed for %s: %s", confirmation_number, exc)
+            return False
 
-        Handles formats like "7:00 PM", "19:00", "7:30pm".
-        """
-        text = text.strip().upper()
 
-        if "AM" not in text and "PM" not in text:
-            # Assume 24-hour format
-            return text.replace(" ", "")
+def _extract_rid(html: str) -> int | None:
+    """Extract the numeric restaurant ID from an OpenTable page.
 
-        is_pm = "PM" in text
-        text = text.replace("AM", "").replace("PM", "").strip()
-        parts = text.split(":")
-        hour = int(parts[0])
-        minute = parts[1] if len(parts) > 1 else "00"
+    Tries multiple patterns:
+    1. ``data-rid="12345"`` attribute
+    2. ``"rid":12345`` in embedded JSON
+    3. ``"restaurantId":12345`` in embedded JSON
+    """
+    # Pattern 1: data attribute
+    m = re.search(r'data-rid="(\d+)"', html)
+    if m:
+        return int(m.group(1))
 
-        if is_pm and hour != 12:
-            hour += 12
-        elif not is_pm and hour == 12:
-            hour = 0
+    # Pattern 2: "rid":N in JSON
+    m = re.search(r'"rid"\s*:\s*(\d+)', html)
+    if m:
+        return int(m.group(1))
 
-        return f"{hour:02d}:{minute}"
+    # Pattern 3: "restaurantId":N in JSON
+    m = re.search(r'"restaurantId"\s*:\s*(\d+)', html)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+
+def _parse_availability_response(data: dict) -> list[TimeSlot]:
+    """Parse the GraphQL availability response into TimeSlot objects."""
+    slots: list[TimeSlot] = []
+    availability_list = data.get("data", {}).get("availability", [])
+    if not availability_list:
+        return slots
+
+    for restaurant_avail in availability_list:
+        for day in restaurant_avail.get("availabilityDays", []):
+            for slot_data in day.get("slots", []):
+                time_str = slot_data.get("timeString", "")
+                token = slot_data.get("slotAvailabilityToken", "")
+                slot_hash = slot_data.get("slotHash", "")
+                if not time_str:
+                    continue
+                parsed_time = _parse_time(time_str)
+                slots.append(
+                    TimeSlot(
+                        time=parsed_time,
+                        platform=BookingPlatform.OPENTABLE,
+                        type=None,
+                        config_id=f"{token}|{slot_hash}",
+                    )
+                )
+    return slots
+
+
+def _parse_time(text: str) -> str:
+    """Parse time text into HH:MM format.
+
+    Handles formats like "7:00 PM", "19:00", "7:30pm".
+    """
+    text = text.strip().upper()
+
+    if "AM" not in text and "PM" not in text:
+        return text.replace(" ", "")
+
+    is_pm = "PM" in text
+    text = text.replace("AM", "").replace("PM", "").strip()
+    parts = text.split(":")
+    hour = int(parts[0])
+    minute = parts[1] if len(parts) > 1 else "00"
+
+    if is_pm and hour != 12:
+        hour += 12
+    elif not is_pm and hour == 12:
+        hour = 0
+
+    return f"{hour:02d}:{minute}"

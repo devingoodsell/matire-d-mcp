@@ -13,11 +13,14 @@ from src.tools.booking import (
     _book_via_resy,
     _ensure_opentable_credentials,
     _ensure_resy_credentials,
+    _filter_nearby_slots,
     _format_time,
     _get_auth_manager,
     _get_credential_store,
     _normalise_time,
+    _split_config_id,
     _time_diff,
+    _time_diff_signed,
     register_booking_tools,
 )
 from tests.factories import make_reservation, make_restaurant
@@ -347,141 +350,118 @@ class TestStoreResyCredentials:
 
 
 class TestStoreOpenTableCredentials:
-    async def test_success_login_works(self, booking_mcp):
+    async def test_success_with_csrf_token(self, booking_mcp):
         mcp, _db, mock_cred_store, _auth = booking_mcp
 
-        mock_ot_client = AsyncMock()
-        mock_ot_client._login = AsyncMock()
-        mock_ot_client.close = AsyncMock()
-
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "store_opentable_credentials",
-                    {"email": "user@ot.com", "password": "secret"},
-                )
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "store_opentable_credentials",
+                {"csrf_token": "csrf-abc", "email": "user@ot.com"},
+            )
         text = str(result)
-        assert "OpenTable credentials saved and verified" in text
+        assert "OpenTable credentials saved" in text
         mock_cred_store.save_credentials.assert_called_once_with(
-            "opentable", {"email": "user@ot.com", "password": "secret"},
+            "opentable", {"csrf_token": "csrf-abc", "email": "user@ot.com"},
         )
-        mock_ot_client.close.assert_awaited_once()
 
-    async def test_login_fails_auth_error(self, booking_mcp):
-        from src.clients.resy_auth import AuthError
-
+    async def test_success_with_all_fields(self, booking_mcp):
         mcp, _db, mock_cred_store, _auth = booking_mcp
 
-        mock_ot_client = AsyncMock()
-        mock_ot_client._login = AsyncMock(side_effect=AuthError("bad ot creds"))
-        mock_ot_client.close = AsyncMock()
-
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "store_opentable_credentials",
-                    {"email": "user@ot.com", "password": "wrong"},
-                )
+        async with Client(mcp) as client:
+            result = await client.call_tool(
+                "store_opentable_credentials",
+                {
+                    "csrf_token": "csrf-abc",
+                    "email": "user@ot.com",
+                    "first_name": "Test",
+                    "last_name": "User",
+                    "phone": "212-555-1234",
+                },
+            )
         text = str(result)
-        assert "Credentials saved but login verification failed" in text
-        assert "bad ot creds" in text
-        # Credentials still saved before the login attempt
-        mock_cred_store.save_credentials.assert_called_once()
-        # close() always called via finally
-        mock_ot_client.close.assert_awaited_once()
-
-    async def test_close_always_called_on_success(self, booking_mcp):
-        """Verify close() is called in the finally block even on success."""
-        mcp, _db, _store, _auth = booking_mcp
-
-        mock_ot_client = AsyncMock()
-        mock_ot_client._login = AsyncMock()
-        mock_ot_client.close = AsyncMock()
-
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
-            async with Client(mcp) as client:
-                await client.call_tool(
-                    "store_opentable_credentials",
-                    {"email": "u@ot.com", "password": "p"},
-                )
-        mock_ot_client.close.assert_awaited_once()
+        assert "OpenTable credentials saved" in text
+        saved = mock_cred_store.save_credentials.call_args[0][1]
+        assert saved["csrf_token"] == "csrf-abc"
+        assert saved["first_name"] == "Test"
+        assert saved["last_name"] == "User"
+        assert saved["phone"] == "212-555-1234"
 
     async def test_env_vars_used_when_no_params(self, booking_mcp):
-        """When no args passed, env var credentials are used."""
+        """When no args passed, env var CSRF token is used."""
         mcp, _db, mock_cred_store, _auth = booking_mcp
 
-        mock_ot_client = AsyncMock()
-        mock_ot_client._login = AsyncMock()
-        mock_ot_client.close = AsyncMock()
-
         mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = "env-csrf"
         mock_settings.opentable_email = "ot-env@test.com"
-        mock_settings.opentable_password = "ot-env-pw"
-        with (
-            patch("src.config.get_settings", return_value=mock_settings),
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
-        ):
+        with patch("src.config.get_settings", return_value=mock_settings):
             async with Client(mcp) as client:
                 result = await client.call_tool("store_opentable_credentials", {})
         text = str(result)
-        assert "OpenTable credentials saved and verified" in text
-        mock_cred_store.save_credentials.assert_called_once_with(
-            "opentable", {"email": "ot-env@test.com", "password": "ot-env-pw"},
-        )
+        assert "OpenTable credentials saved" in text
+        saved = mock_cred_store.save_credentials.call_args[0][1]
+        assert saved["csrf_token"] == "env-csrf"
+        assert saved["email"] == "ot-env@test.com"
 
     async def test_params_override_env_vars(self, booking_mcp):
         """Explicit params take priority over env vars."""
         mcp, _db, mock_cred_store, _auth = booking_mcp
 
-        mock_ot_client = AsyncMock()
-        mock_ot_client._login = AsyncMock()
-        mock_ot_client.close = AsyncMock()
-
         mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = "env-csrf"
         mock_settings.opentable_email = "ot-env@test.com"
-        mock_settings.opentable_password = "ot-env-pw"
-        with (
-            patch("src.config.get_settings", return_value=mock_settings),
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
-        ):
+        with patch("src.config.get_settings", return_value=mock_settings):
             async with Client(mcp) as client:
                 result = await client.call_tool(
                     "store_opentable_credentials",
-                    {"email": "explicit@ot.com", "password": "explicit-pw"},
+                    {"csrf_token": "explicit-csrf", "email": "explicit@ot.com"},
                 )
         text = str(result)
-        assert "OpenTable credentials saved and verified" in text
-        mock_cred_store.save_credentials.assert_called_once_with(
-            "opentable", {"email": "explicit@ot.com", "password": "explicit-pw"},
-        )
+        assert "OpenTable credentials saved" in text
+        saved = mock_cred_store.save_credentials.call_args[0][1]
+        assert saved["csrf_token"] == "explicit-csrf"
+        assert saved["email"] == "explicit@ot.com"
 
-    async def test_missing_both_returns_error(self, booking_mcp):
-        """When no params and no env vars, returns instructional error."""
+    async def test_missing_csrf_returns_error(self, booking_mcp):
+        """When no CSRF token and no env vars, returns instructional error."""
         mcp, _db, _store, _auth = booking_mcp
         mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = None
         mock_settings.opentable_email = None
-        mock_settings.opentable_password = None
         with patch("src.config.get_settings", return_value=mock_settings):
             async with Client(mcp) as client:
                 result = await client.call_tool("store_opentable_credentials", {})
         text = str(result)
-        assert "Missing credentials" in text
-        assert "OPENTABLE_EMAIL" in text
+        assert "Missing CSRF token" in text
+        assert "OPENTABLE_CSRF_TOKEN" in text
+
+    async def test_optional_fields_excluded_when_none(self, booking_mcp):
+        """When optional fields not provided, they aren't saved."""
+        mcp, _db, mock_cred_store, _auth = booking_mcp
+
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "store_opentable_credentials",
+                {"csrf_token": "tok"},
+            )
+        saved = mock_cred_store.save_credentials.call_args[0][1]
+        assert "first_name" not in saved
+        assert "last_name" not in saved
+        assert "phone" not in saved
+
+    async def test_email_defaults_to_empty(self, booking_mcp):
+        """When no email, it defaults to empty string."""
+        mcp, _db, mock_cred_store, _auth = booking_mcp
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = None
+        mock_settings.opentable_email = None
+        async with Client(mcp) as client:
+            await client.call_tool(
+                "store_opentable_credentials",
+                {"csrf_token": "tok"},
+            )
+        saved = mock_cred_store.save_credentials.call_args[0][1]
+        assert saved["email"] == ""
 
 
 # ── check_availability ─────────────────────────────────────────────────────
@@ -546,10 +526,9 @@ class TestCheckAvailability:
         assert "7:00 PM - Patio" in text
         assert "Resy" in text
 
-    async def test_opentable_only_slots_no_resy_creds(self, booking_mcp):
-        """No Resy creds at all — skip Resy, OpenTable returns slots."""
+    async def test_opentable_slots_no_resy_creds(self, booking_mcp):
+        """No Resy creds — skip Resy, show OpenTable DAPI slots."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        # No resy creds
         mock_cred_store.get_credentials.return_value = None
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
@@ -557,27 +536,26 @@ class TestCheckAvailability:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.find_availability.return_value = [
-            _make_ot_slot("20:00", "Main Room"),
-        ]
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:00"),
+            _make_ot_slot("20:30"),
+        ])
         mock_ot_client.close = AsyncMock()
 
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
+        with patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client):
             async with Client(mcp) as client:
                 result = await client.call_tool(
                     "check_availability",
                     {"restaurant_name": "Carbone", "date": "2026-02-14", "party_size": 2},
                 )
         text = str(result)
-        assert "8:00 PM - Main Room" in text
+        assert "7:00 PM" in text
+        assert "8:30 PM" in text
         assert "Opentable" in text
         mock_ot_client.close.assert_awaited_once()
 
-    async def test_both_resy_and_opentable_slots_combined(self, booking_mcp):
-        """Both platforms return slots — all are combined."""
+    async def test_resy_slots_plus_opentable_slots(self, booking_mcp):
+        """Resy returns slots, OpenTable returns slots — both shown."""
         mcp, db, _store, _auth = booking_mcp
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
@@ -585,17 +563,14 @@ class TestCheckAvailability:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.find_availability.return_value = [
-            _make_ot_slot("20:30"),
-        ]
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("20:00"),
+        ])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -610,9 +585,11 @@ class TestCheckAvailability:
                 )
         text = str(result)
         assert "7:00 PM" in text
-        assert "8:30 PM" in text
         assert "Resy" in text
+        assert "8:00 PM" in text
         assert "Opentable" in text
+        assert "Also check OpenTable directly" in text
+        assert "opentable.com/r/carbone-nyc" in text
 
     async def test_preferred_time_sorting(self, booking_mcp):
         mcp, db, _store, _auth = booking_mcp
@@ -649,8 +626,8 @@ class TestCheckAvailability:
         slot_lines = [ln for ln in lines if "PM" in ln or "AM" in ln]
         assert "7:00 PM" in slot_lines[0]
 
-    async def test_no_slots_from_either_platform(self, booking_mcp):
-        """Both Resy and OpenTable return empty — 'No availability' message."""
+    async def test_no_resy_slots_but_has_ot_slots(self, booking_mcp):
+        """Resy returns empty, OT DAPI returns slots — shows OT slots."""
         mcp, db, _store, _auth = booking_mcp
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
@@ -658,15 +635,14 @@ class TestCheckAvailability:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.find_availability.return_value = []
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:30"),
+        ])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -678,11 +654,12 @@ class TestCheckAvailability:
                     {"restaurant_name": "Carbone", "date": "2026-02-14"},
                 )
         text = str(result)
-        assert "No availability" in text
         assert "Carbone" in text
+        assert "7:30 PM" in text
+        assert "Opentable" in text
 
-    async def test_resy_auth_fails_still_checks_opentable(self, booking_mcp):
-        """When Resy auth fails, OpenTable slots are still returned."""
+    async def test_resy_auth_fails_still_shows_opentable_slots(self, booking_mcp):
+        """When Resy auth fails, OpenTable DAPI slots are still shown."""
         from src.clients.resy_auth import AuthError
 
         mcp, db, _store, mock_auth = booking_mcp
@@ -693,22 +670,19 @@ class TestCheckAvailability:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.find_availability.return_value = [
-            _make_ot_slot("20:00"),
-        ]
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:00"),
+        ])
         mock_ot_client.close = AsyncMock()
 
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
+        with patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client):
             async with Client(mcp) as client:
                 result = await client.call_tool(
                     "check_availability",
                     {"restaurant_name": "Carbone", "date": "2026-02-14"},
                 )
         text = str(result)
-        assert "8:00 PM" in text
+        assert "7:00 PM" in text
         assert "Opentable" in text
 
     async def test_restaurant_has_cached_resy_venue_id_skips_matcher(self, booking_mcp):
@@ -747,16 +721,13 @@ class TestCheckAvailability:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.find_availability.return_value = [_make_ot_slot("20:00")]
+        mock_ot_client.find_availability = AsyncMock(return_value=[_make_ot_slot("20:00")])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
             patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -773,7 +744,7 @@ class TestCheckAvailability:
             matcher_inst.find_opentable_slug.assert_not_called()
         text = str(result)
         assert "7:00 PM" in text
-        assert "8:00 PM" in text
+        assert "Also check OpenTable directly" in text
 
     async def test_no_cached_opentable_id_uses_matcher(self, booking_mcp):
         """When opentable_id is None, VenueMatcher.find_opentable_slug is called."""
@@ -784,16 +755,13 @@ class TestCheckAvailability:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.find_availability.return_value = [_make_ot_slot("20:00")]
+        mock_ot_client.find_availability = AsyncMock(return_value=[_make_ot_slot("20:00")])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
             patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -809,7 +777,8 @@ class TestCheckAvailability:
                 )
             matcher_inst.find_opentable_slug.assert_called_once()
         text = str(result)
-        assert "8:00 PM" in text
+        assert "Also check OpenTable directly" in text
+        assert "opentable.com/r/carbone-nyc" in text
 
     async def test_no_resy_creds_skips_resy_entirely(self, booking_mcp):
         """When no Resy creds, Resy is skipped entirely — no ResyClient created."""
@@ -866,8 +835,8 @@ class TestCheckAvailability:
         text = str(result)
         assert "No availability" in text
 
-    async def test_negative_cached_opentable_skips_matcher(self, booking_mcp):
-        """opentable_id="" (negative cache) skips VenueMatcher entirely."""
+    async def test_negative_cached_opentable_skips_ot(self, booking_mcp):
+        """opentable_id="" (negative cache) skips OT entirely."""
         mcp, db, _store, _auth = booking_mcp
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id="rv1", opentable_id="",
@@ -877,6 +846,7 @@ class TestCheckAvailability:
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
             patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
+            patch("src.clients.opentable.OpenTableClient") as mock_ot_cls,
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -891,6 +861,8 @@ class TestCheckAvailability:
                 )
             # VenueMatcher.find_opentable_slug should NOT be called
             matcher_inst.find_opentable_slug.assert_not_called()
+            # OT client should not be constructed
+            mock_ot_cls.assert_not_called()
         text = str(result)
         # Should still show Resy slots
         assert "7:00 PM" in text
@@ -1025,8 +997,8 @@ class TestMakeReservation:
         assert upcoming[0].restaurant_name == "Carbone"
         assert upcoming[0].platform_confirmation_id == "RES-12345"
 
-    async def test_resy_booking_fails_falls_through_to_opentable(self, booking_mcp):
-        """Resy _book_via_resy returns None — falls through to OpenTable."""
+    async def test_resy_fails_ot_exact_match_books(self, booking_mcp):
+        """Resy has no match, OT DAPI has exact match → books on OT."""
         mcp, db, _store, _auth = booking_mcp
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
@@ -1034,21 +1006,18 @@ class TestMakeReservation:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {
-            "confirmation_number": "OT-999",
-        }
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:00", config_id="tok1|hash1"),
+        ])
+        mock_ot_client.book = AsyncMock(return_value={"confirmation_number": "OT-BOOKED"})
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
-            # No matching slot for Resy -> _book_via_resy returns None
             resy_inst.find_availability.return_value = [
                 _make_slot("18:00"),  # different time than requested
             ]
@@ -1065,86 +1034,17 @@ class TestMakeReservation:
                 )
         text = str(result)
         assert "Booked!" in text
-        assert "OT-999" in text
+        assert "OT-BOOKED" in text
         assert "OpenTable" in text
         mock_ot_client.close.assert_awaited_once()
 
-    async def test_opentable_booking_succeeds(self, booking_mcp):
-        """When no Resy creds, OpenTable booking succeeds directly."""
-        mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.side_effect = lambda p: (
-            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
-        )
-        restaurant = make_restaurant(
-            name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
-        )
-        await db.cache_restaurant(restaurant)
-
-        mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {
-            "confirmation_number": "OT-555",
-        }
-        mock_ot_client.close = AsyncMock()
-
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "make_reservation",
-                    {
-                        "restaurant_name": "Carbone",
-                        "date": "2026-02-14",
-                        "time": "19:00",
-                        "party_size": 2,
-                    },
-                )
-        text = str(result)
-        assert "Booked!" in text
-        assert "OT-555" in text
-        assert "OpenTable" in text
-
+        # Verify reservation saved
         upcoming = await db.get_upcoming_reservations()
         assert len(upcoming) == 1
         assert upcoming[0].platform == BookingPlatform.OPENTABLE
 
-    async def test_opentable_booking_error_falls_through_to_deep_links(self, booking_mcp):
-        """OpenTable book returns error — falls through to deep link fallback."""
-        mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.side_effect = lambda p: (
-            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
-        )
-        restaurant = make_restaurant(
-            name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
-        )
-        await db.cache_restaurant(restaurant)
-
-        mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"error": "slot taken"}
-        mock_ot_client.close = AsyncMock()
-
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "make_reservation",
-                    {
-                        "restaurant_name": "Carbone",
-                        "date": "2026-02-14",
-                        "time": "19:00",
-                        "party_size": 2,
-                    },
-                )
-        text = str(result)
-        assert "Could not complete booking automatically" in text
-        assert "opentable.com" in text
-        mock_ot_client.close.assert_awaited_once()
-
-    async def test_deep_link_fallback_both_venue_id_and_ot_slug(self, booking_mcp):
-        """Both venue_id and ot_slug exist — both deep links shown."""
+    async def test_resy_fails_ot_exact_match_booking_error_nearby(self, booking_mcp):
+        """OT exact match exists but book() returns error → nearby slots shown."""
         mcp, db, _store, _auth = booking_mcp
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
@@ -1152,19 +1052,59 @@ class TestMakeReservation:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"error": "unavailable"}
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:00", config_id="tok1|hash1"),
+            _make_ot_slot("19:30", config_id="tok2|hash2"),
+        ])
+        mock_ot_client.book = AsyncMock(return_value={"error": "CSRF invalid"})
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
-            # No matching slot for the requested time
+            resy_inst.find_availability.return_value = [
+                _make_slot("18:00"),  # different time than requested
+            ]
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        # book() failed, falls through to proximity filter — 19:30 is nearby
+        assert "not available" in text
+        assert "Nearby times on OpenTable" in text
+        assert "7:30 PM" in text
+
+    async def test_ot_slots_none_nearby_falls_to_deep_link(self, booking_mcp):
+        """OT has slots but all outside proximity window → deep link fallback."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("22:00", config_id="t|h"),  # way outside ±30/+60 window
+        ])
+        mock_ot_client.close = AsyncMock()
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
             resy_inst.find_availability.return_value = []
 
             async with Client(mcp) as client:
@@ -1178,9 +1118,146 @@ class TestMakeReservation:
                     },
                 )
         text = str(result)
-        assert "Could not complete booking automatically" in text
+        assert "Not available" in text
+        assert "either Resy or OpenTable" in text
+
+    async def test_ot_nearby_slots_with_resy_times(self, booking_mcp):
+        """OT has nearby slots AND Resy had times → both shown."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:30", config_id="t|h"),  # nearby
+        ])
+        mock_ot_client.close = AsyncMock()
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            resy_inst.find_availability.return_value = [
+                _make_slot("18:00"),  # Resy time (not matching 19:00)
+                _make_slot("20:00"),  # Resy time (not matching 19:00)
+            ]
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        assert "Nearby times on OpenTable" in text
+        assert "7:30 PM" in text
+        assert "Resy available times" in text
+        assert "6:00 PM" in text
+        assert "8:00 PM" in text
+
+    async def test_no_resy_creds_ot_nearby_slots(self, booking_mcp):
+        """No Resy creds, OT has nearby slots → shows nearby times."""
+        mcp, db, mock_cred_store, _auth = booking_mcp
+        mock_cred_store.get_credentials.return_value = None
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.find_availability = AsyncMock(return_value=[
+            _make_ot_slot("19:30", config_id="t|h"),  # 30 min later — in window
+        ])
+        mock_ot_client.close = AsyncMock()
+
+        with patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        assert "not available" in text
+        assert "Nearby times on OpenTable" in text
+        assert "7:30 PM" in text
+
+    async def test_no_resy_creds_ot_no_slots_shows_deep_link(self, booking_mcp):
+        """No Resy creds, OT slug exists but no slots → deep link fallback."""
+        mcp, db, mock_cred_store, _auth = booking_mcp
+        mock_cred_store.get_credentials.return_value = None
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
+        mock_ot_client.close = AsyncMock()
+
+        with patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        assert "Not available" in text
+        assert "either Resy or OpenTable" in text
+        assert "opentable.com" in text
+
+    async def test_deep_link_fallback_both_venue_id_and_ot_slug(self, booking_mcp):
+        """Both venue_id and ot_slug exist, OT has no slots — both deep links."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            name="Carbone", resy_venue_id="rv1", opentable_id="carbone-nyc",
+        )
+        await db.cache_restaurant(restaurant)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
+        mock_ot_client.close = AsyncMock()
+
+        with (
+            patch("src.clients.resy.ResyClient") as mock_resy_cls,
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
+        ):
+            resy_inst = AsyncMock()
+            mock_resy_cls.return_value = resy_inst
+            resy_inst.find_availability.return_value = []
+
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "make_reservation",
+                    {
+                        "restaurant_name": "Carbone",
+                        "date": "2026-02-14",
+                        "time": "19:00",
+                        "party_size": 2,
+                    },
+                )
+        text = str(result)
+        assert "Not available" in text
+        assert "either Resy or OpenTable" in text
         assert "resy.com" in text
-        assert "resy.com/cities/ny/rv1" in text
+        assert "resy.com/cities/ny/carbone" in text
         assert "opentable.com" in text
 
     async def test_deep_link_with_only_venue_id(self, booking_mcp):
@@ -1223,34 +1300,29 @@ class TestMakeReservation:
                     },
                 )
         text = str(result)
-        assert "Could not complete booking automatically" in text
+        assert "Not available" in text
         assert "resy.com" in text
-        assert "resy.com/cities/ny/rv1" in text
+        assert "resy.com/cities/ny/carbone" in text
         assert "opentable.com" not in text
         # Available times shown in fallback
-        assert "7:00 PM is not available on Resy" in text
+        assert "Resy available times" in text
         assert "5:30 PM" in text
         assert "8:00 PM" in text
 
-    async def test_deep_link_with_only_ot_slug(self, booking_mcp):
-        """Only ot_slug exists, no resy venue_id — only OpenTable deep link."""
+    async def test_deep_link_with_only_ot_slug_no_ot_slots(self, booking_mcp):
+        """Only ot_slug exists, OT has no slots — deep link fallback."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.side_effect = lambda p: (
-            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
-        )
+        mock_cred_store.get_credentials.return_value = None
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
         )
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"error": "fail"}
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
         mock_ot_client.close = AsyncMock()
 
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
+        with patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client):
             async with Client(mcp) as client:
                 result = await client.call_tool(
                     "make_reservation",
@@ -1262,7 +1334,8 @@ class TestMakeReservation:
                     },
                 )
         text = str(result)
-        assert "Could not complete booking automatically" in text
+        assert "Not available" in text
+        assert "either Resy or OpenTable" in text
         assert "opentable.com" in text
         assert "resy.com" not in text
 
@@ -1275,16 +1348,13 @@ class TestMakeReservation:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"confirmation_number": "OT-NEG"}
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
             patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -1305,8 +1375,8 @@ class TestMakeReservation:
             matcher_inst.find_resy_venue.assert_not_called()
             resy_inst.find_availability.assert_not_called()
         text = str(result)
-        assert "Booked!" in text
-        assert "OT-NEG" in text
+        assert "Not available" in text
+        assert "opentable.com" in text
 
     async def test_negative_cached_opentable_skips_matcher_in_booking(self, booking_mcp):
         """opentable_id="" (negative cache) skips VenueMatcher for OpenTable."""
@@ -1432,8 +1502,8 @@ class TestMakeReservation:
         text = str(result)
         assert "localspot.com" in text
 
-    async def test_resy_auth_fails_tries_opentable(self, booking_mcp):
-        """Resy auth error is caught — tries OpenTable next."""
+    async def test_resy_auth_fails_ot_checked(self, booking_mcp):
+        """Resy auth error is caught — OT DAPI still checked."""
         from src.clients.resy_auth import AuthError
 
         mcp, db, _store, mock_auth = booking_mcp
@@ -1444,13 +1514,10 @@ class TestMakeReservation:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"confirmation_number": "OT-AUTH"}
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
         mock_ot_client.close = AsyncMock()
 
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
+        with patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client):
             async with Client(mcp) as client:
                 result = await client.call_tool(
                     "make_reservation",
@@ -1462,31 +1529,27 @@ class TestMakeReservation:
                     },
                 )
         text = str(result)
-        assert "Booked!" in text
-        assert "OT-AUTH" in text
-        assert "OpenTable" in text
+        assert "Not available" in text
+        assert "either Resy or OpenTable" in text
+        assert "resy.com" in text
+        assert "opentable.com" in text
 
-    async def test_no_resy_creds_tries_opentable_directly(self, booking_mcp):
-        """When no Resy creds, jumps straight to OpenTable attempt."""
+    async def test_no_resy_creds_ot_checked_no_slots(self, booking_mcp):
+        """No Resy creds, OT checked but empty → deep link fallback."""
         mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.side_effect = lambda p: (
-            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
-        )
+        mock_cred_store.get_credentials.return_value = None
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
         )
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"confirmation_number": "OT-DIRECT"}
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             async with Client(mcp) as client:
                 result = await client.call_tool(
@@ -1500,44 +1563,8 @@ class TestMakeReservation:
                 )
             mock_resy_cls.assert_not_called()
         text = str(result)
-        assert "Booked!" in text
-        assert "OT-DIRECT" in text
-
-    async def test_opentable_auth_error_falls_through_to_deep_links(self, booking_mcp):
-        """OpenTable AuthError during login is caught — falls through to deep links."""
-        from src.clients.resy_auth import AuthError
-
-        mcp, db, mock_cred_store, _auth = booking_mcp
-        mock_cred_store.get_credentials.side_effect = lambda p: (
-            {"email": "ot@test.com", "password": "pass"} if p == "opentable" else None
-        )
-        restaurant = make_restaurant(
-            name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
-        )
-        await db.cache_restaurant(restaurant)
-
-        mock_ot_client = AsyncMock()
-        mock_ot_client.book.side_effect = AuthError("OpenTable login failed: net::ERR")
-        mock_ot_client.close = AsyncMock()
-
-        with patch(
-            "src.clients.opentable.OpenTableClient",
-            return_value=mock_ot_client,
-        ):
-            async with Client(mcp) as client:
-                result = await client.call_tool(
-                    "make_reservation",
-                    {
-                        "restaurant_name": "Carbone",
-                        "date": "2026-02-14",
-                        "time": "19:00",
-                        "party_size": 2,
-                    },
-                )
-        text = str(result)
-        assert "Could not complete booking automatically" in text
+        assert "Not available" in text
         assert "opentable.com" in text
-        mock_ot_client.close.assert_awaited_once()
 
     async def test_venue_matcher_used_when_no_resy_venue_id(self, booking_mcp):
         """When restaurant has no resy_venue_id, VenueMatcher is called."""
@@ -1574,12 +1601,8 @@ class TestMakeReservation:
         text = str(result)
         assert "Booked!" in text
 
-    async def test_resy_venue_not_found_falls_through_to_opentable(self, booking_mcp):
-        """Resy creds exist and auth passes, but matcher returns no venue_id.
-
-        The ``if venue_id:`` check at make_reservation line 291 is False,
-        so execution falls through directly to the OpenTable section.
-        """
+    async def test_resy_venue_not_found_checks_ot(self, booking_mcp):
+        """Resy matcher returns no venue_id — falls through to OT DAPI."""
         mcp, db, _store, _auth = booking_mcp
         restaurant = make_restaurant(
             name="Carbone", resy_venue_id=None, opentable_id="carbone-nyc",
@@ -1587,16 +1610,13 @@ class TestMakeReservation:
         await db.cache_restaurant(restaurant)
 
         mock_ot_client = AsyncMock()
-        mock_ot_client.book.return_value = {"confirmation_number": "OT-FALLTHRU"}
+        mock_ot_client.find_availability = AsyncMock(return_value=[])
         mock_ot_client.close = AsyncMock()
 
         with (
             patch("src.clients.resy.ResyClient") as mock_resy_cls,
             patch("src.matching.venue_matcher.VenueMatcher") as mock_matcher_cls,
-            patch(
-                "src.clients.opentable.OpenTableClient",
-                return_value=mock_ot_client,
-            ),
+            patch("src.clients.opentable.OpenTableClient", return_value=mock_ot_client),
         ):
             resy_inst = AsyncMock()
             mock_resy_cls.return_value = resy_inst
@@ -1618,9 +1638,8 @@ class TestMakeReservation:
             # Resy availability should NOT be checked since venue_id is None
             resy_inst.find_availability.assert_not_called()
         text = str(result)
-        assert "Booked!" in text
-        assert "OT-FALLTHRU" in text
-        assert "OpenTable" in text
+        assert "Not available" in text
+        assert "opentable.com" in text
 
 
 # ── _book_via_resy ─────────────────────────────────────────────────────────
@@ -2587,23 +2606,24 @@ class TestEnsureOpentableCredentials:
         """When CredentialStore already has OpenTable creds, return them."""
         mock_store = MagicMock()
         mock_store.get_credentials.return_value = {
+            "csrf_token": "tok",
             "email": "ot@test.com",
-            "password": "pw",
         }
         with patch("src.tools.booking._get_credential_store", return_value=mock_store):
             result = await _ensure_opentable_credentials()
-        assert result == {"email": "ot@test.com", "password": "pw"}
+        assert result == {"csrf_token": "tok", "email": "ot@test.com"}
         mock_store.save_credentials.assert_not_called()
 
     async def test_resolves_from_config_store(self):
-        """When CredentialStore is empty, resolves from ConfigStore/env vars."""
+        """When CredentialStore is empty, resolves CSRF from ConfigStore/env vars."""
         mock_store = MagicMock()
         mock_store.get_credentials.return_value = None
         mock_store.save_credentials = MagicMock()
 
         mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = "config-csrf"
         mock_settings.opentable_email = "config@test.com"
-        mock_settings.opentable_password = "config-pw"
+        mock_settings.opentable_cookies = "session=abc"
 
         with (
             patch("src.tools.booking._get_credential_store", return_value=mock_store),
@@ -2612,37 +2632,25 @@ class TestEnsureOpentableCredentials:
         ):
             result = await _ensure_opentable_credentials()
 
-        assert result == {"email": "config@test.com", "password": "config-pw"}
+        assert result == {
+            "csrf_token": "config-csrf",
+            "email": "config@test.com",
+            "cookies": "session=abc",
+        }
         mock_store.save_credentials.assert_called_once_with(
-            "opentable", {"email": "config@test.com", "password": "config-pw"},
+            "opentable",
+            {"csrf_token": "config-csrf", "email": "config@test.com", "cookies": "session=abc"},
         )
 
-    async def test_returns_none_when_no_email(self):
-        """When no email available, returns None."""
+    async def test_returns_none_when_no_csrf_token(self):
+        """When no CSRF token available, returns None."""
         mock_store = MagicMock()
         mock_store.get_credentials.return_value = None
 
         mock_settings = MagicMock()
-        mock_settings.opentable_email = None
-        mock_settings.opentable_password = "pw"
-
-        with (
-            patch("src.tools.booking._get_credential_store", return_value=mock_store),
-            patch("src.server._config_store", None),
-            patch("src.config.get_settings", return_value=mock_settings),
-        ):
-            result = await _ensure_opentable_credentials()
-
-        assert result is None
-
-    async def test_returns_none_when_no_password(self):
-        """When no password available, returns None."""
-        mock_store = MagicMock()
-        mock_store.get_credentials.return_value = None
-
-        mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = None
         mock_settings.opentable_email = "ot@test.com"
-        mock_settings.opentable_password = None
+        mock_settings.opentable_cookies = None
 
         with (
             patch("src.tools.booking._get_credential_store", return_value=mock_store),
@@ -2652,3 +2660,105 @@ class TestEnsureOpentableCredentials:
             result = await _ensure_opentable_credentials()
 
         assert result is None
+
+    async def test_email_defaults_to_empty_when_none(self):
+        """When email is None, defaults to empty string."""
+        mock_store = MagicMock()
+        mock_store.get_credentials.return_value = None
+        mock_store.save_credentials = MagicMock()
+
+        mock_settings = MagicMock()
+        mock_settings.opentable_csrf_token = "csrf"
+        mock_settings.opentable_email = None
+        mock_settings.opentable_cookies = None
+
+        with (
+            patch("src.tools.booking._get_credential_store", return_value=mock_store),
+            patch("src.server._config_store", None),
+            patch("src.config.get_settings", return_value=mock_settings),
+        ):
+            result = await _ensure_opentable_credentials()
+
+        assert result == {"csrf_token": "csrf", "email": ""}
+
+
+# ── New helper function tests ──────────────────────────────────────────────
+
+
+class TestTimeDiffSigned:
+    def test_slot_later(self):
+        assert _time_diff_signed("19:30", "19:00") == 30
+
+    def test_slot_earlier(self):
+        assert _time_diff_signed("18:30", "19:00") == -30
+
+    def test_same_time(self):
+        assert _time_diff_signed("19:00", "19:00") == 0
+
+    def test_invalid_returns_9999(self):
+        assert _time_diff_signed("bad", "19:00") == 9999
+
+
+class TestFilterNearbySlots:
+    def test_within_window(self):
+        slots = [
+            _make_ot_slot("18:30"),  # -30 min
+            _make_ot_slot("19:00"),  # exact (excluded)
+            _make_ot_slot("19:30"),  # +30 min
+            _make_ot_slot("20:00"),  # +60 min
+        ]
+        result = _filter_nearby_slots(slots, "19:00")
+        times = [s.time for s in result]
+        assert "18:30" in times
+        assert "19:30" in times
+        assert "20:00" in times
+        assert "19:00" not in times
+
+    def test_outside_window(self):
+        slots = [
+            _make_ot_slot("17:00"),  # -120 min — too early
+            _make_ot_slot("21:00"),  # +120 min — too late
+        ]
+        result = _filter_nearby_slots(slots, "19:00")
+        assert result == []
+
+    def test_boundary_30_earlier(self):
+        slots = [_make_ot_slot("18:30")]
+        result = _filter_nearby_slots(slots, "19:00")
+        assert len(result) == 1
+
+    def test_boundary_31_earlier_excluded(self):
+        slots = [_make_ot_slot("18:29")]
+        result = _filter_nearby_slots(slots, "19:00")
+        assert result == []
+
+    def test_boundary_60_later(self):
+        slots = [_make_ot_slot("20:00")]
+        result = _filter_nearby_slots(slots, "19:00")
+        assert len(result) == 1
+
+    def test_boundary_61_later_excluded(self):
+        slots = [_make_ot_slot("20:01")]
+        result = _filter_nearby_slots(slots, "19:00")
+        assert result == []
+
+    def test_empty_slots(self):
+        result = _filter_nearby_slots([], "19:00")
+        assert result == []
+
+
+class TestSplitConfigId:
+    def test_normal(self):
+        assert _split_config_id("tok|hash") == ("tok", "hash")
+
+    def test_none(self):
+        assert _split_config_id(None) == ("", "")
+
+    def test_empty(self):
+        assert _split_config_id("") == ("", "")
+
+    def test_no_pipe(self):
+        assert _split_config_id("nopipe") == ("", "")
+
+    def test_multiple_pipes(self):
+        assert _split_config_id("a|b|c") == ("a", "b|c")

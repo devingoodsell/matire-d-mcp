@@ -331,7 +331,7 @@ class TestBook:
 
         assert result == {"resy_token": "res_abc"}
         call_kwargs = mock_async_client.return_value.post.call_args
-        payload = call_kwargs.kwargs["json"]
+        payload = call_kwargs.kwargs["data"]
         assert payload["book_token"] == "bt_1"
         assert payload["source_id"] == "resy.com-venue-details"
         assert "struct_payment_method" not in payload
@@ -347,11 +347,19 @@ class TestBook:
 
         assert result == {"resy_token": "res_def"}
         call_kwargs = mock_async_client.return_value.post.call_args
-        payload = call_kwargs.kwargs["json"]
-        assert payload["struct_payment_method"] == pm
+        payload = call_kwargs.kwargs["data"]
+        assert payload["struct_payment_method"] == '{"id": 123, "type": "visa"}'
 
     @patch("src.clients.resy.httpx.AsyncClient")
-    async def test_non_200_returns_error(self, mock_async_client):
+    async def test_success_with_201(self, mock_async_client):
+        resp = _mock_response(status_code=201, json_data={"resy_token": "res_201"})
+        mock_async_client.return_value = _mock_client(resp)
+
+        result = await ResyClient(auth_token="t").book("bt_201")
+        assert result == {"resy_token": "res_201"}
+
+    @patch("src.clients.resy.httpx.AsyncClient")
+    async def test_non_2xx_returns_error(self, mock_async_client):
         resp = _mock_response(status_code=422, text="Unprocessable Entity")
         mock_async_client.return_value = _mock_client(resp)
 

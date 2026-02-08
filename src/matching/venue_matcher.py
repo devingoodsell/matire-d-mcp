@@ -60,10 +60,11 @@ def _is_bookable_page(html: str) -> bool:
 
 
 def generate_resy_deep_link(
-    venue_id: str, date: str, party_size: int
+    restaurant_name: str, date: str, party_size: int
 ) -> str:
     """Generate a Resy booking deep link."""
-    return f"https://resy.com/cities/ny/{venue_id}?date={date}&seats={party_size}"
+    slug = _slugify(restaurant_name)
+    return f"https://resy.com/cities/ny/{slug}?date={date}&seats={party_size}"
 
 
 def generate_opentable_deep_link(

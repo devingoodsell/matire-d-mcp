@@ -1,5 +1,6 @@
 """Resy API client for availability checking and reservation booking."""
 
+import json
 import logging
 
 import httpx
@@ -199,16 +200,16 @@ class ResyClient:
             "source_id": "resy.com-venue-details",
         }
         if payment_method:
-            payload["struct_payment_method"] = payment_method
+            payload["struct_payment_method"] = json.dumps(payment_method)
 
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 f"{self.BASE_URL}/3/book",
                 headers=self._headers(),
-                json=payload,
+                data=payload,
             )
 
-        if response.status_code != 200:
+        if response.status_code not in (200, 201):
             logger.warning(
                 "Resy book failed (HTTP %d): %s",
                 response.status_code, response.text,

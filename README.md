@@ -191,6 +191,32 @@ Claude: ✓ Resy credentials saved and validated!
 
 If you skipped booking credentials during setup, you can add them later via env vars in `.env` or by passing them as tool arguments (note: arguments are visible in chat history).
 
+### 9. Set Up OpenTable Session (Required for OpenTable Booking)
+
+OpenTable's API requires authenticated browser session cookies to bypass bot protection. Without this step, OpenTable availability checks and bookings will fail.
+
+During `python -m src.setup` (step 3), when you provide an OpenTable email you'll be prompted for:
+- **OpenTable x-csrf-token** — from browser DevTools
+- **OpenTable Cookie header** — from browser DevTools
+
+**How to get these values (re-run setup when cookies expire, typically every few days):**
+
+1. Open https://www.opentable.com in Chrome and **log in**
+2. Open DevTools (`Cmd+Option+I` on macOS, `F12` on Windows)
+3. Go to the **Network** tab
+4. Navigate to any restaurant page (e.g. search for "Carbone" and click it)
+5. In the Network list, click any request to `www.opentable.com`
+6. In the **Headers** tab, copy the full **`Cookie`** header value
+7. Find any request to a `/dapi/` endpoint (POST) and copy the **`x-csrf-token`** header value
+8. Re-run setup to update the stored values:
+
+```bash
+source .venv/bin/activate
+python -m src.setup
+```
+
+> **Why is this needed?** OpenTable uses Cloudflare bot protection that blocks plain HTTP requests. By storing your browser's session cookies, the MCP server can make API calls as your authenticated session. The cookies are encrypted at rest using the same Fernet encryption as all other credentials.
+
 ### Security Model
 
 | Layer | Protection |
@@ -274,7 +300,7 @@ pip install -e ".[security]"
 | Google Places | ~$17/1000 detail calls | Primary discovery |
 | OpenWeatherMap | Free (1000/day) | Weather context |
 | Resy | Free (unofficial) | Booking |
-| OpenTable | Free (browser automation) | Booking |
+| OpenTable | Free (DAPI + browser session) | Booking |
 
 **Estimated monthly cost for heavy use:** $3-8 (with caching)
 
@@ -322,7 +348,7 @@ restaurant-mcp/
 │   ├── clients/                 # API clients + resilience + cache
 │   ├── matching/                # Cross-platform venue ID resolution
 │   └── tools/                   # MCP tool definitions
-├── tests/                       # 945 tests, 100% branch coverage
+├── tests/                       # 1112 tests, 100% branch coverage
 ├── data/                        # Runtime: DB, logs, credentials (gitignored)
 ├── pyproject.toml
 ├── .env.example
@@ -345,7 +371,28 @@ bash scripts/test.sh
 bash scripts/lint.sh
 ```
 
-**Testing:** 945 tests with 100% branch coverage (`fail_under = 100` enforced).
+**Testing:** 1112 unit tests with 100% branch coverage (`fail_under = 100` enforced).
+
+### Integration Tests
+
+On-demand integration tests exercise the full stack against live Resy and OpenTable APIs:
+
+```bash
+# Run all integration tests
+python -m pytest tests/integration/ -m integration -v
+
+# Resy only
+python -m pytest tests/integration/test_resy_integration.py -m integration -v
+
+# OpenTable only (requires session cookies — see step 9 above)
+python -m pytest tests/integration/test_opentable_integration.py -m integration -v
+
+# With a specific restaurant / date
+INTEGRATION_RESTAURANT="Lilia" INTEGRATION_DATE="2026-03-15" \
+  python -m pytest tests/integration/ -m integration -v
+```
+
+Integration tests are excluded from `validate.sh` and default pytest runs. They require real credentials in the credential store (set up via `python -m src.setup`).
 
 ## Prior Art
 
@@ -399,4 +446,4 @@ The **NY Restaurant Reservation Anti-Piracy Act** (S.9365A, effective February 2
 
 ---
 
-**Status:** All 8 EPICs complete. 945 tests, 100% branch coverage.
+**Status:** All 8 EPICs complete. 1112 tests, 100% branch coverage. Integration tests for Resy and OpenTable.

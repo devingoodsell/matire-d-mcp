@@ -96,9 +96,9 @@ class TestGenerateResyDeepLink:
     """generate_resy_deep_link: correct Resy booking URL format."""
 
     def test_returns_correct_url_format(self):
-        result = generate_resy_deep_link("carbone-new-york", "2026-02-14", 2)
+        result = generate_resy_deep_link("Carbone", "2026-02-14", 2)
         assert result == (
-            "https://resy.com/cities/ny/carbone-new-york"
+            "https://resy.com/cities/ny/carbone"
             "?date=2026-02-14&seats=2"
         )
 

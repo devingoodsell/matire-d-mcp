@@ -65,12 +65,15 @@ async def _ensure_opentable_credentials() -> dict | None:
         return creds
 
     # Master-key mode: resolve from ConfigStore / env vars
+    csrf_token = await resolve_credential("opentable_csrf_token")
     email = await resolve_credential("opentable_email")
-    password = await resolve_credential("opentable_password")
-    if not email or not password:
+    if not csrf_token:
         return None
 
-    creds = {"email": email, "password": password}
+    creds: dict = {"csrf_token": csrf_token, "email": email or ""}
+    cookies = await resolve_credential("opentable_cookies")
+    if cookies:
+        creds["cookies"] = cookies
     store.save_credentials("opentable", creds)
     return creds
 
@@ -136,55 +139,54 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
     @mcp.tool
     async def store_opentable_credentials(
+        csrf_token: str | None = None,
         email: str | None = None,
-        password: str | None = None,
+        first_name: str | None = None,
+        last_name: str | None = None,
+        phone: str | None = None,
     ) -> str:
-        """Save your OpenTable account credentials for automated booking.
+        """Save your OpenTable DAPI credentials for automated booking.
 
-        **Recommended:** Set OPENTABLE_EMAIL and OPENTABLE_PASSWORD as
-        environment variables (or in your .env file) so credentials never
-        appear in chat history. If env vars are set, call this tool with
-        no arguments.
+        The CSRF token (``x-csrf-token``) is required for booking. To get it:
+        1. Log into opentable.com in your browser
+        2. Open DevTools → Network tab
+        3. Make any action (search, etc.)
+        4. Find any request to ``/dapi/`` and copy the ``x-csrf-token`` header value
 
-        Credentials are encrypted and stored locally.
-
-        After saving, the system will verify the credentials work
-        by attempting a test login.
+        **Recommended:** Set OPENTABLE_CSRF_TOKEN as an environment variable
+        so it never appears in chat history.
 
         Args:
+            csrf_token: The x-csrf-token value from your browser session
+                        (or set OPENTABLE_CSRF_TOKEN env var).
             email: Your OpenTable account email (or set OPENTABLE_EMAIL env var).
-            password: Your OpenTable account password (or set OPENTABLE_PASSWORD env var).
+            first_name: First name for reservations.
+            last_name: Last name for reservations.
+            phone: Phone number for reservations.
 
         Returns:
-            Confirmation that credentials were saved and verified.
+            Confirmation that credentials were saved.
         """
-        from src.clients.opentable import OpenTableClient
-        from src.clients.resy_auth import AuthError
-
+        csrf_token = csrf_token or await resolve_credential("opentable_csrf_token")
         email = email or await resolve_credential("opentable_email")
-        password = password or await resolve_credential("opentable_password")
-        if not email or not password:
+        if not csrf_token:
             return (
-                "Missing credentials. Set OPENTABLE_EMAIL and OPENTABLE_PASSWORD env vars, "
-                "or pass them as arguments."
+                "Missing CSRF token. Set OPENTABLE_CSRF_TOKEN env var, "
+                "or pass csrf_token as an argument. "
+                "Get it from browser DevTools → Network → any /dapi/ request → x-csrf-token header."
             )
 
         store = _get_credential_store()
+        creds: dict = {"csrf_token": csrf_token, "email": email or ""}
+        if first_name:
+            creds["first_name"] = first_name
+        if last_name:
+            creds["last_name"] = last_name
+        if phone:
+            creds["phone"] = phone
 
-        # Save first so the client can read them during login
-        store.save_credentials("opentable", {
-            "email": email, "password": password
-        })
-
-        # Verify by attempting login
-        ot_client = OpenTableClient(credential_store=store)
-        try:
-            await ot_client._login()  # noqa: SLF001
-            return "OpenTable credentials saved and verified."
-        except AuthError as exc:
-            return f"Credentials saved but login verification failed: {exc}"
-        finally:
-            await ot_client.close()
+        store.save_credentials("opentable", creds)
+        return "OpenTable credentials saved."
 
     # ── Availability ───────────────────────────────────────────────────
 
@@ -237,7 +239,6 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
         # ── Check Resy ──
         resy_creds = await _ensure_resy_credentials()
-        store = _get_credential_store()
         venue_id = restaurant.resy_venue_id
 
         if resy_creds:
@@ -259,7 +260,7 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             except AuthError:
                 logger.warning("Resy auth failed during availability check")
 
-        # ── Check OpenTable ──
+        # ── Check OpenTable via DAPI ──
         ot_slug = restaurant.opentable_id
         if ot_slug is None:
             matcher = VenueMatcher(db=db)
@@ -268,6 +269,7 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
         if ot_slug:
             from src.clients.opentable import OpenTableClient
 
+            store = _get_credential_store()
             ot_client = OpenTableClient(credential_store=store)
             try:
                 ot_slots = await ot_client.find_availability(
@@ -280,7 +282,7 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             finally:
                 await ot_client.close()
 
-        if not all_slots:
+        if not all_slots and not ot_slug:
             return (
                 f"No availability at {restaurant.name} on {parsed_date} "
                 f"for {party_size} guests."
@@ -298,6 +300,13 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             lines.append(
                 f"  {_format_time(slot.time)}{type_label} ({platform_label})"
             )
+        if ot_slug:
+            from src.matching.venue_matcher import generate_opentable_deep_link
+
+            ot_link = generate_opentable_deep_link(
+                ot_slug, parsed_date, preferred_time or "19:00", party_size,
+            )
+            lines.append(f"Also check OpenTable directly: {ot_link}")
         return "\n".join(lines)
 
     # ── Booking ────────────────────────────────────────────────────────
@@ -330,8 +339,6 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             generate_opentable_deep_link,
             generate_resy_deep_link,
         )
-        from src.models.enums import BookingPlatform
-        from src.models.reservation import Reservation
         from src.tools.date_utils import parse_date
 
         db = get_db()
@@ -349,7 +356,6 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
 
         normalised_time = _normalise_time(time)
         resy_creds = await _ensure_resy_credentials()
-        store = _get_credential_store()
 
         # ── Try Resy first ──
         venue_id = restaurant.resy_venue_id
@@ -387,89 +393,128 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             except AuthError:
                 logger.warning("Resy auth failed during booking")
 
-        # ── Try OpenTable ──
+        # ── Try OpenTable DAPI ──
         ot_slug = restaurant.opentable_id
         if ot_slug is None:
             matcher = VenueMatcher(db=db)
             ot_slug = await matcher.find_opentable_slug(restaurant)
 
-        if ot_slug and await _ensure_opentable_credentials():
+        if ot_slug:
             from src.clients.opentable import OpenTableClient
+            from src.models.enums import BookingPlatform
 
+            store = _get_credential_store()
             ot_client = OpenTableClient(credential_store=store)
             try:
-                result = await ot_client.book(
+                ot_slots = await ot_client.find_availability(
                     restaurant_slug=ot_slug,
                     date=parsed_date,
-                    time=normalised_time,
                     party_size=party_size,
-                    special_requests=special_requests,
+                    preferred_time=normalised_time,
                 )
-                if "error" not in result:
-                    conf = result.get("confirmation_number", "")
-                    reservation = Reservation(
-                        restaurant_id=restaurant.id,
-                        restaurant_name=restaurant.name,
-                        platform=BookingPlatform.OPENTABLE,
-                        platform_confirmation_id=str(conf),
-                        date=parsed_date,
-                        time=normalised_time,
-                        party_size=party_size,
-                        special_requests=special_requests,
-                    )
-                    await db.save_reservation(reservation)
 
-                    from src.clients.calendar import generate_gcal_link
+                if ot_slots:
+                    # Exact match?
+                    exact = [s for s in ot_slots if s.time == normalised_time]
+                    if exact:
+                        slot = exact[0]
+                        token, slot_hash = _split_config_id(slot.config_id)
+                        book_result = await ot_client.book(
+                            restaurant_slug=ot_slug,
+                            date=parsed_date,
+                            time=normalised_time,
+                            party_size=party_size,
+                            slot_availability_token=token,
+                            slot_hash=slot_hash,
+                        )
+                        if "confirmation_number" in book_result:
+                            from src.clients.calendar import generate_gcal_link
+                            from src.models.reservation import Reservation
 
-                    cal_link = generate_gcal_link(
-                        restaurant_name=restaurant.name,
-                        restaurant_address=restaurant.address,
-                        date=parsed_date,
-                        time=normalised_time,
-                        party_size=party_size,
-                        confirmation_id=str(conf),
-                        platform="OpenTable",
-                    )
-                    return (
-                        f"Booked! {restaurant.name}, {parsed_date} at "
-                        f"{_format_time(normalised_time)}, party of {party_size}.\n"
-                        f"Confirmation: {conf} (OpenTable)\n"
-                        f"Add to calendar: {cal_link}"
-                    )
-            except AuthError:
-                logger.warning("OpenTable login failed during booking")
+                            conf_id = book_result["confirmation_number"]
+                            reservation = Reservation(
+                                restaurant_id=restaurant.id,
+                                restaurant_name=restaurant.name,
+                                platform=BookingPlatform.OPENTABLE,
+                                platform_confirmation_id=str(conf_id),
+                                date=parsed_date,
+                                time=normalised_time,
+                                party_size=party_size,
+                                special_requests=special_requests,
+                            )
+                            await db.save_reservation(reservation)
+
+                            cal_link = generate_gcal_link(
+                                restaurant_name=restaurant.name,
+                                restaurant_address=restaurant.address,
+                                date=parsed_date,
+                                time=normalised_time,
+                                party_size=party_size,
+                                platform="OpenTable",
+                            )
+                            msg = (
+                                f"Booked! {restaurant.name}, {parsed_date} at "
+                                f"{_format_time(normalised_time)}, "
+                                f"party of {party_size} (OpenTable).\n"
+                                f"Confirmation: {conf_id}\n"
+                                f"Add to calendar: {cal_link}"
+                            )
+                            return msg
+
+                    # Proximity filter: ≤30min earlier OR ≤60min later
+                    nearby = _filter_nearby_slots(ot_slots, normalised_time)
+                    if nearby:
+                        ot_link = generate_opentable_deep_link(
+                            ot_slug, parsed_date, normalised_time, party_size,
+                        )
+                        nearby_times = ", ".join(
+                            _format_time(s.time) for s in nearby
+                        )
+                        msg = (
+                            f"{_format_time(normalised_time)} is not available "
+                            f"at {restaurant.name} on OpenTable.\n"
+                            f"Nearby times on OpenTable: {nearby_times}\n"
+                            f"Book on OpenTable: {ot_link}"
+                        )
+                        if resy_available_times:
+                            resy_formatted = ", ".join(
+                                _format_time(t) for t in resy_available_times
+                            )
+                            msg += f"\nResy available times: {resy_formatted}"
+                        return msg
             finally:
                 await ot_client.close()
 
         # ── Fallback: deep links ──
-        links: list[str] = []
+        resy_link = None
+        ot_link = None
         if venue_id:
-            links.append(
-                generate_resy_deep_link(venue_id, parsed_date, party_size)
+            resy_link = generate_resy_deep_link(
+                restaurant.name, parsed_date, party_size
             )
         if ot_slug:
-            links.append(
-                generate_opentable_deep_link(
-                    ot_slug, parsed_date, normalised_time, party_size
-                )
+            ot_link = generate_opentable_deep_link(
+                ot_slug, parsed_date, normalised_time, party_size
             )
-        if links:
-            link_text = "\n".join(links)
+        if resy_link or ot_link:
             msg = (
-                f"Could not complete booking automatically for {restaurant.name}.\n"
+                f"Not available at {restaurant.name} on {parsed_date} at "
+                f"{_format_time(normalised_time)} on either Resy or OpenTable.\n"
             )
             if resy_available_times:
                 formatted = ", ".join(
                     _format_time(t) for t in resy_available_times
                 )
                 msg += (
-                    f"{_format_time(normalised_time)} is not available on Resy. "
-                    f"Available times: {formatted}\n"
+                    f"Resy available times: {formatted}\n"
                 )
-            msg += f"Try booking directly:\n{link_text}"
+            if resy_link:
+                msg += f"Try booking on Resy: {resy_link}\n"
+            if ot_link:
+                msg += f"Try booking on OpenTable: {ot_link}\n"
             if restaurant.website:
-                msg += f"\nRestaurant website: {restaurant.website}"
-            return msg
+                msg += f"Restaurant website: {restaurant.website}"
+            return msg.rstrip()
         msg = f"'{restaurant.name}' doesn't appear to be on Resy or OpenTable."
         if restaurant.website:
             msg += f"\nTry their website: {restaurant.website}"
@@ -718,3 +763,42 @@ def _time_diff(time_a: str, time_b: str) -> int:
         return abs(a_min - b_min)
     except (ValueError, IndexError):
         return 9999
+
+
+def _time_diff_signed(slot_time: str, requested_time: str) -> int:
+    """Signed difference: slot - requested, in minutes.
+
+    Positive means slot is later, negative means slot is earlier.
+    """
+    try:
+        s = slot_time.split(":")
+        r = requested_time.split(":")
+        return (int(s[0]) * 60 + int(s[1])) - (int(r[0]) * 60 + int(r[1]))
+    except (ValueError, IndexError):
+        return 9999
+
+
+def _filter_nearby_slots(
+    slots: list,
+    requested_time: str,
+) -> list:
+    """Filter slots within the proximity window: ≤30min earlier OR ≤60min later.
+
+    Excludes exact matches (diff == 0).
+    """
+    result = []
+    for slot in slots:
+        diff = _time_diff_signed(slot.time, requested_time)
+        if diff == 0:
+            continue
+        if -30 <= diff <= 60:
+            result.append(slot)
+    return result
+
+
+def _split_config_id(config_id: str | None) -> tuple[str, str]:
+    """Split an OT config_id of the form 'token|hash' into (token, hash)."""
+    if not config_id or "|" not in config_id:
+        return ("", "")
+    parts = config_id.split("|", 1)
+    return (parts[0], parts[1])

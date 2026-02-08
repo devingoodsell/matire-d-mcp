@@ -24,6 +24,7 @@ echo ""
 # Step 2: Tests + Coverage
 echo "--- [2/3] Tests + Coverage ---"
 python -m pytest \
+    -m "not integration" \
     --cov=src \
     --cov-branch \
     --cov-report=term-missing \

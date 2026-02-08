@@ -1,13 +1,16 @@
-"""Tests for OpenTableClient: browser automation for OpenTable reservations."""
+"""Tests for OpenTableClient: DAPI HTTP API for OpenTable reservations."""
 
-import sys
-from types import ModuleType
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
-import pytest
+import httpx
 
-from src.clients.opentable import OpenTableClient, _build_restaurant_url
-from src.clients.resy_auth import AuthError
+from src.clients.opentable import (
+    OpenTableClient,
+    _build_restaurant_url,
+    _extract_rid,
+    _parse_availability_response,
+    _parse_time,
+)
 from src.models.enums import BookingPlatform
 from src.storage.credentials import CredentialStore
 
@@ -15,67 +18,6 @@ from src.storage.credentials import CredentialStore
 def _make_credential_store(tmp_path) -> CredentialStore:
     """Build a real CredentialStore backed by a temp directory."""
     return CredentialStore(tmp_path / "creds")
-
-
-def _mock_page():
-    """Build a fully-mocked Playwright page."""
-    page = AsyncMock()
-    page.goto = AsyncMock()
-    page.fill = AsyncMock()
-    page.click = AsyncMock()
-    page.wait_for_load_state = AsyncMock()
-    page.wait_for_selector = AsyncMock()
-    page.query_selector_all = AsyncMock(return_value=[])
-    page.query_selector = AsyncMock(return_value=None)
-    return page
-
-
-def _mock_browser_chain():
-    """Build the full mock chain for Playwright objects.
-
-    Returns (mock_apw, page, browser, pw_instance).
-    mock_apw is the object returned by async_playwright(), whose .start()
-    gives pw_instance.
-    """
-    page = _mock_page()
-    context = AsyncMock()
-    context.new_page = AsyncMock(return_value=page)
-    context.add_init_script = AsyncMock()
-    browser = AsyncMock()
-    browser.new_context = AsyncMock(return_value=context)
-    browser.close = AsyncMock()
-    pw_instance = AsyncMock()
-    pw_instance.chromium.launch = AsyncMock(return_value=browser)
-    pw_instance.stop = AsyncMock()
-    # Mock async_playwright().start()
-    mock_apw = MagicMock()
-    mock_apw.start = AsyncMock(return_value=pw_instance)
-    return mock_apw, page, browser, pw_instance
-
-
-def _fake_pw_module(mock_apw):
-    """Build a fake playwright.async_api module with async_playwright."""
-    fake_mod = ModuleType("playwright.async_api")
-    fake_mod.async_playwright = MagicMock(return_value=mock_apw)
-    return fake_mod
-
-
-def _pw_sys_modules(fake_mod):
-    """Return the sys.modules dict to patch for playwright imports."""
-    return {
-        "playwright": ModuleType("playwright"),
-        "playwright.async_api": fake_mod,
-    }
-
-
-def _make_client_with_browser(tmp_path, page, browser, pw_instance):
-    """Create an OpenTableClient with browser already injected."""
-    store = _make_credential_store(tmp_path)
-    client = OpenTableClient(store)
-    client._browser = browser
-    client._page = page
-    client._pw = pw_instance
-    return client
 
 
 # ---- _build_restaurant_url --------------------------------------------------
@@ -103,521 +45,663 @@ class TestBuildRestaurantUrl:
         assert "dateTime=2026-03-01T18%3A30" in result
 
 
-# ---- _parse_time (static method) -------------------------------------------
+# ---- _parse_time (module function) ------------------------------------------
 
 
 class TestParseTime:
     """_parse_time converts various time formats to HH:MM."""
 
     def test_7pm(self):
-        assert OpenTableClient._parse_time("7:00 PM") == "19:00"
+        assert _parse_time("7:00 PM") == "19:00"
 
     def test_midnight(self):
-        assert OpenTableClient._parse_time("12:00 AM") == "00:00"
+        assert _parse_time("12:00 AM") == "00:00"
 
     def test_noon(self):
-        assert OpenTableClient._parse_time("12:00 PM") == "12:00"
+        assert _parse_time("12:00 PM") == "12:00"
 
     def test_morning_with_minutes(self):
-        assert OpenTableClient._parse_time("9:30 AM") == "09:30"
+        assert _parse_time("9:30 AM") == "09:30"
 
     def test_24h_passthrough(self):
-        assert OpenTableClient._parse_time("19:00") == "19:00"
+        assert _parse_time("19:00") == "19:00"
 
     def test_no_minutes_pm(self):
-        assert OpenTableClient._parse_time("7pm") == "19:00"
+        assert _parse_time("7pm") == "19:00"
 
 
-# ---- _ensure_browser -------------------------------------------------------
+# ---- _extract_rid ------------------------------------------------------------
 
 
-class TestEnsureBrowser:
-    """_ensure_browser: launch, no-op second call, ImportError."""
+class TestExtractRid:
+    """_extract_rid: extract numeric restaurant ID from HTML."""
 
-    async def test_first_call_launches_browser(self, tmp_path):
-        store = _make_credential_store(tmp_path)
-        client = OpenTableClient(store)
+    def test_data_rid_attribute(self):
+        html = '<div data-rid="8033" class="restaurant">'
+        assert _extract_rid(html) == 8033
 
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        fake_mod = _fake_pw_module(mock_apw)
+    def test_rid_in_json(self):
+        html = '{"restaurant":{"rid":12345,"name":"Test"}}'
+        assert _extract_rid(html) == 12345
 
-        with patch.dict(sys.modules, _pw_sys_modules(fake_mod)):
-            await client._ensure_browser()
+    def test_restaurant_id_in_json(self):
+        html = '{"restaurantId":99999,"name":"Test"}'
+        assert _extract_rid(html) == 99999
 
-        assert client._browser is browser
-        assert client._page is page
-        assert client._pw is pw_instance
-        pw_instance.chromium.launch.assert_awaited_once()
-        # Verify headless=True for server compatibility
-        call_kwargs = pw_instance.chromium.launch.call_args[1]
-        assert call_kwargs["headless"] is True
+    def test_no_rid_returns_none(self):
+        html = "<html><body>No restaurant data here</body></html>"
+        assert _extract_rid(html) is None
 
-    async def test_second_call_is_noop(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
+    def test_data_rid_priority_over_json(self):
+        """data-rid attribute is checked first."""
+        html = '<div data-rid="111">{"rid":222}</div>'
+        assert _extract_rid(html) == 111
 
-        # Calling again should not launch a new browser
-        await client._ensure_browser()
 
-        # launch was never called because _browser was already set
-        pw_instance.chromium.launch.assert_not_awaited()
+# ---- _parse_availability_response -------------------------------------------
 
-    async def test_import_error_raises_auth_error(self, tmp_path):
-        store = _make_credential_store(tmp_path)
-        client = OpenTableClient(store)
 
-        fake_modules = {
-            "playwright": None,
-            "playwright.async_api": None,
+class TestParseAvailabilityResponse:
+    """Parse GraphQL availability response into TimeSlot objects."""
+
+    def test_normal_response(self):
+        data = {
+            "data": {
+                "availability": [
+                    {
+                        "restaurantId": 8033,
+                        "availabilityDays": [
+                            {
+                                "date": "2026-02-14",
+                                "slots": [
+                                    {
+                                        "dateTime": "2026-02-14T19:00",
+                                        "timeString": "7:00 PM",
+                                        "slotAvailabilityToken": "tok1",
+                                        "slotHash": "hash1",
+                                    },
+                                    {
+                                        "dateTime": "2026-02-14T20:30",
+                                        "timeString": "8:30 PM",
+                                        "slotAvailabilityToken": "tok2",
+                                        "slotHash": "hash2",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
         }
-        with patch.dict(sys.modules, fake_modules):
-            with pytest.raises(AuthError, match="Playwright is not installed"):
-                await client._ensure_browser()
+        slots = _parse_availability_response(data)
+        assert len(slots) == 2
+        assert slots[0].time == "19:00"
+        assert slots[0].platform == BookingPlatform.OPENTABLE
+        assert slots[0].config_id == "tok1|hash1"
+        assert slots[1].time == "20:30"
+
+    def test_empty_availability(self):
+        data = {"data": {"availability": []}}
+        assert _parse_availability_response(data) == []
+
+    def test_missing_data_key(self):
+        assert _parse_availability_response({}) == []
+
+    def test_empty_slots(self):
+        data = {
+            "data": {
+                "availability": [
+                    {"restaurantId": 1, "availabilityDays": [{"date": "2026-02-14", "slots": []}]},
+                ],
+            }
+        }
+        assert _parse_availability_response(data) == []
+
+    def test_empty_time_string_skipped(self):
+        data = {
+            "data": {
+                "availability": [
+                    {
+                        "restaurantId": 1,
+                        "availabilityDays": [
+                            {
+                                "date": "2026-02-14",
+                                "slots": [
+                                    {
+                                        "dateTime": "",
+                                        "timeString": "",
+                                        "slotAvailabilityToken": "t",
+                                        "slotHash": "h",
+                                    },
+                                    {
+                                        "dateTime": "2026-02-14T19:00",
+                                        "timeString": "7:00 PM",
+                                        "slotAvailabilityToken": "t2",
+                                        "slotHash": "h2",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
+        slots = _parse_availability_response(data)
+        assert len(slots) == 1
+        assert slots[0].time == "19:00"
 
 
-# ---- close ------------------------------------------------------------------
+# ---- OpenTableClient._get_http / close --------------------------------------
 
 
-class TestClose:
-    """close: cleanup browser/pw resources."""
+class TestHttpLifecycle:
+    """_get_http: lazy creation, close: cleanup."""
 
-    async def test_with_browser_closes_everything(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
+    def test_get_http_creates_client(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+
+        http = client._get_http()
+        assert isinstance(http, httpx.AsyncClient)
+
+    def test_get_http_reuses_client(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+
+        http1 = client._get_http()
+        http2 = client._get_http()
+        assert http1 is http2
+
+    def test_get_http_includes_cookies_when_stored(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {
+            "email": "u@t.com",
+            "cookies": "otSessionId=abc123; otOther=xyz",
+        })
+        client = OpenTableClient(store)
+
+        http = client._get_http()
+        assert http.headers["cookie"] == "otSessionId=abc123; otOther=xyz"
+
+    def test_get_http_no_cookie_header_without_cookies(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"email": "u@t.com"})
+        client = OpenTableClient(store)
+
+        http = client._get_http()
+        assert "cookie" not in http.headers
+
+    async def test_close_cleans_up(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+        _ = client._get_http()
 
         await client.close()
+        assert client._http is None
 
-        browser.close.assert_awaited_once()
-        pw_instance.stop.assert_awaited_once()
-        assert client._browser is None
-        assert client._context is None
-        assert client._page is None
-        assert client._pw is None
-        assert client._logged_in is False
-
-    async def test_without_browser_is_noop(self, tmp_path):
+    async def test_close_without_http_is_noop(self, tmp_path):
         store = _make_credential_store(tmp_path)
         client = OpenTableClient(store)
-
-        # Should not raise
-        await client.close()
-
-        assert client._browser is None
-        assert client._pw is None
-
-    async def test_with_pw_but_no_browser(self, tmp_path):
-        """Edge case: pw exists but browser was never assigned."""
-        store = _make_credential_store(tmp_path)
-        client = OpenTableClient(store)
-        pw_instance = AsyncMock()
-        pw_instance.stop = AsyncMock()
-        client._pw = pw_instance
 
         await client.close()
-
-        pw_instance.stop.assert_awaited_once()
-        assert client._pw is None
+        assert client._http is None
 
 
-# ---- _login -----------------------------------------------------------------
+# ---- _resolve_restaurant_id -------------------------------------------------
 
 
-class TestLogin:
-    """_login: credentials check, navigation, form filling."""
+class TestResolveRestaurantId:
+    """_resolve_restaurant_id: slug → numeric rid via page HTML."""
 
-    async def test_no_credentials_raises_auth_error(self, tmp_path):
+    async def test_success_extracts_rid(self, tmp_path):
         store = _make_credential_store(tmp_path)
         client = OpenTableClient(store)
 
-        with pytest.raises(AuthError, match="OpenTable credentials not configured"):
-            await client._login()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '<div data-rid="8033">Ci Siamo</div>'
 
-    async def test_success_navigates_and_fills(self, tmp_path):
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        rid = await client._resolve_restaurant_id("ci-siamo-new-york")
+        assert rid == 8033
+        mock_http.get.assert_awaited_once()
+
+    async def test_caches_result(self, tmp_path):
         store = _make_credential_store(tmp_path)
-        store.save_credentials("opentable", {"email": "u@x.com", "password": "pw123"})
         client = OpenTableClient(store)
 
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        fake_mod = _fake_pw_module(mock_apw)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = '{"rid":8033}'
 
-        with (
-            patch.dict(sys.modules, _pw_sys_modules(fake_mod)),
-            patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock),
-        ):
-            await client._login()
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
 
-        assert client._logged_in is True
-        page.goto.assert_awaited()
-        page.fill.assert_any_await('input[name="email"]', "u@x.com")
-        page.fill.assert_any_await('input[name="password"]', "pw123")
-        page.click.assert_awaited_once_with('button[type="submit"]')
-        page.wait_for_load_state.assert_awaited_once_with("domcontentloaded")
+        rid1 = await client._resolve_restaurant_id("ci-siamo")
+        rid2 = await client._resolve_restaurant_id("ci-siamo")
+        assert rid1 == rid2 == 8033
+        # Only one HTTP call — second used cache
+        assert mock_http.get.await_count == 1
 
-    async def test_page_interaction_fails_raises_auth_error(self, tmp_path):
+    async def test_non_200_returns_none(self, tmp_path):
         store = _make_credential_store(tmp_path)
-        store.save_credentials("opentable", {"email": "u@x.com", "password": "pw123"})
-
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.goto.side_effect = RuntimeError("navigation failed")
-        fake_mod = _fake_pw_module(mock_apw)
-
         client = OpenTableClient(store)
 
-        with (
-            patch.dict(sys.modules, _pw_sys_modules(fake_mod)),
-            patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock),
-        ):
-            with pytest.raises(AuthError, match="OpenTable login failed"):
-                await client._login()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "Not found"
+
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        rid = await client._resolve_restaurant_id("nonexistent")
+        assert rid is None
+
+    async def test_no_rid_in_page_returns_none(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.text = "<html>No rid here</html>"
+
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        rid = await client._resolve_restaurant_id("no-rid")
+        assert rid is None
+
+    async def test_http_error_returns_none(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(side_effect=httpx.ConnectError("timeout"))
+        client._http = mock_http
+
+        rid = await client._resolve_restaurant_id("timeout-slug")
+        assert rid is None
 
 
 # ---- find_availability -------------------------------------------------------
 
 
 class TestFindAvailability:
-    """find_availability: scraping time slots from OpenTable."""
+    """find_availability: DAPI GraphQL query for time slots."""
 
     async def test_success_with_slots(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
 
-        slot1 = AsyncMock()
-        slot1.inner_text = AsyncMock(return_value="7:00 PM")
-        slot2 = AsyncMock()
-        slot2.inner_text = AsyncMock(return_value="8:30 PM")
-        page.query_selector_all.return_value = [slot1, slot2]
+        # Mock _resolve_restaurant_id
+        client._rid_cache["carbone-new-york"] = 8033
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
+        gql_response = {
+            "data": {
+                "availability": [
+                    {
+                        "restaurantId": 8033,
+                        "availabilityDays": [
+                            {
+                                "date": "2026-03-15",
+                                "slots": [
+                                    {
+                                        "dateTime": "2026-03-15T19:00",
+                                        "timeString": "7:00 PM",
+                                        "slotAvailabilityToken": "t1",
+                                        "slotHash": "h1",
+                                    },
+                                    {
+                                        "dateTime": "2026-03-15T20:30",
+                                        "timeString": "8:30 PM",
+                                        "slotAvailabilityToken": "t2",
+                                        "slotHash": "h2",
+                                    },
+                                ],
+                            }
+                        ],
+                    }
+                ],
+            }
+        }
 
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            slots = await client.find_availability(
-                "carbone-new-york", "2025-03-15", 2, "19:00"
-            )
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = gql_response
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        slots = await client.find_availability(
+            "carbone-new-york", "2026-03-15", 2, "19:00"
+        )
 
         assert len(slots) == 2
         assert slots[0].time == "19:00"
         assert slots[0].platform == BookingPlatform.OPENTABLE
         assert slots[1].time == "20:30"
 
-    async def test_empty_text_slots_skipped(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
+    async def test_rid_resolution_fails_returns_empty(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
 
-        slot1 = AsyncMock()
-        slot1.inner_text = AsyncMock(return_value="7:00 PM")
-        slot_empty = AsyncMock()
-        slot_empty.inner_text = AsyncMock(return_value="  ")
-        page.query_selector_all.return_value = [slot1, slot_empty]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "Not found"
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
 
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            slots = await client.find_availability(
-                "carbone-new-york", "2025-03-15", 2, "19:00"
-            )
-
-        assert len(slots) == 1
-        assert slots[0].time == "19:00"
-
-    async def test_no_slots_returns_empty(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.query_selector_all.return_value = []
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            slots = await client.find_availability(
-                "carbone-new-york", "2025-03-15", 2
-            )
-
+        slots = await client.find_availability(
+            "nonexistent", "2026-03-15", 2
+        )
         assert slots == []
 
-    async def test_exception_during_navigation_returns_empty(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.goto.side_effect = RuntimeError("network error")
+    async def test_non_200_gql_returns_empty(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 500
+        mock_resp.text = "Server error"
 
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            slots = await client.find_availability(
-                "carbone-new-york", "2025-03-15", 2
-            )
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
 
+        slots = await client.find_availability("slug", "2026-03-15", 2)
         assert slots == []
+
+    async def test_http_error_returns_empty(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(side_effect=httpx.ConnectError("network down"))
+        client._http = mock_http
+
+        slots = await client.find_availability("slug", "2026-03-15", 2)
+        assert slots == []
+
+    async def test_default_preferred_time(self, tmp_path):
+        """When no preferred_time, defaults to 19:00."""
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"data": {"availability": []}}
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        await client.find_availability("slug", "2026-03-15", 2)
+        call_args = mock_http.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["variables"]["requestedTime"] == "19:00"
 
 
 # ---- book -------------------------------------------------------------------
 
 
 class TestBook:
-    """book: clicking slots, special requests, confirmation extraction."""
+    """book: DAPI make-reservation endpoint."""
 
     async def test_success_with_confirmation(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {
+            "csrf_token": "csrf-abc",
+            "email": "user@test.com",
+            "first_name": "Test",
+            "last_name": "User",
+            "phone": "212-555-1234",
+        })
+        client = OpenTableClient(store)
+        client._rid_cache["carbone-new-york"] = 8033
 
-        slot_el = AsyncMock()
-        slot_el.click = AsyncMock()
-        page.query_selector_all.return_value = [slot_el]
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"confirmationNumber": "OT-12345"}
 
-        conf_el = AsyncMock()
-        conf_el.inner_text = AsyncMock(return_value="OT-12345")
-        page.query_selector.return_value = conf_el
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2
-            )
+        result = await client.book(
+            "carbone-new-york", "2026-03-15", "19:00", 2,
+            slot_availability_token="tok1",
+            slot_hash="hash1",
+        )
 
         assert result == {"confirmation_number": "OT-12345"}
-        slot_el.click.assert_awaited_once()
+        call_args = mock_http.post.call_args
+        headers = call_args.kwargs.get("headers") or call_args[1].get("headers")
+        assert headers["x-csrf-token"] == "csrf-abc"
 
-    async def test_not_logged_in_calls_login(self, tmp_path):
+    async def test_no_csrf_token_returns_error(self, tmp_path):
         store = _make_credential_store(tmp_path)
-        store.save_credentials("opentable", {"email": "u@x.com", "password": "pw"})
-
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-
-        slot_el = AsyncMock()
-        slot_el.click = AsyncMock()
-        page.query_selector_all.return_value = [slot_el]
-
-        conf_el = AsyncMock()
-        conf_el.inner_text = AsyncMock(return_value="OT-99")
-        page.query_selector.return_value = conf_el
-
+        store.save_credentials("opentable", {"email": "user@test.com"})
         client = OpenTableClient(store)
-        client._browser = browser
-        client._page = page
-        client._pw = pw_instance
 
-        with (
-            patch.object(client, "_login", new_callable=AsyncMock) as mock_login,
-            patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock),
-        ):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2
-            )
-
-        mock_login.assert_awaited_once()
-        assert result == {"confirmation_number": "OT-99"}
-
-    async def test_no_slot_elements_returns_error(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.query_selector_all.return_value = []
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2
-            )
-
-        assert result == {"error": "No time slots found"}
-
-    async def test_special_requests_filled_when_provided(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-
-        slot_el = AsyncMock()
-        slot_el.click = AsyncMock()
-        page.query_selector_all.return_value = [slot_el]
-
-        sr_field = AsyncMock()
-        sr_field.fill = AsyncMock()
-        conf_el = AsyncMock()
-        conf_el.inner_text = AsyncMock(return_value="OT-SR")
-
-        # query_selector is called twice: once for special requests, once for confirmation
-        page.query_selector.side_effect = [sr_field, conf_el]
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2,
-                special_requests="Window seat please",
-            )
-
-        sr_field.fill.assert_awaited_once_with("Window seat please")
-        assert result == {"confirmation_number": "OT-SR"}
-
-    async def test_special_requests_not_filled_when_none(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-
-        slot_el = AsyncMock()
-        slot_el.click = AsyncMock()
-        page.query_selector_all.return_value = [slot_el]
-
-        conf_el = AsyncMock()
-        conf_el.inner_text = AsyncMock(return_value="OT-NONE")
-        page.query_selector.return_value = conf_el
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2,
-                special_requests=None,
-            )
-
-        # query_selector should only be called for confirmation, not special requests
-        assert result == {"confirmation_number": "OT-NONE"}
-
-    async def test_no_special_requests_field_found(self, tmp_path):
-        """sr_field is None -- fill is not called even with special_requests."""
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-
-        slot_el = AsyncMock()
-        slot_el.click = AsyncMock()
-        page.query_selector_all.return_value = [slot_el]
-
-        conf_el = AsyncMock()
-        conf_el.inner_text = AsyncMock(return_value="OT-NOSRF")
-        # First query_selector for special requests returns None, second for confirmation
-        page.query_selector.side_effect = [None, conf_el]
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2,
-                special_requests="Allergies: shellfish",
-            )
-
-        assert result == {"confirmation_number": "OT-NOSRF"}
-
-    async def test_exception_during_booking_returns_error(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.goto.side_effect = RuntimeError("page crashed")
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2
-            )
-
+        result = await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
         assert "error" in result
-        assert "page crashed" in result["error"]
+        assert "CSRF token" in result["error"]
 
-    async def test_no_confirmation_element_returns_empty_number(self, tmp_path):
-        """conf_el is None -- confirmation_number should be empty string."""
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
+    async def test_no_credentials_returns_error(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
 
-        slot_el = AsyncMock()
-        slot_el.click = AsyncMock()
-        page.query_selector_all.return_value = [slot_el]
-        page.query_selector.return_value = None  # no confirmation element
+        result = await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
+        assert "error" in result
+        assert "CSRF token" in result["error"]
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
+    async def test_rid_resolution_fails_returns_error(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
 
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.book(
-                "carbone-new-york", "2025-03-15", "19:00", 2
-            )
+        mock_resp = MagicMock()
+        mock_resp.status_code = 404
+        mock_resp.text = "Not found"
 
-        assert result == {"confirmation_number": ""}
+        mock_http = AsyncMock()
+        mock_http.get = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        result = await client.book(
+            "nonexistent", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
+        assert "error" in result
+        assert "Could not resolve" in result["error"]
+
+    async def test_non_200_booking_response(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
+        mock_resp.text = "Bad request"
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        result = await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
+        assert "error" in result
+        assert "status 400" in result["error"]
+
+    async def test_http_error_during_booking(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(side_effect=httpx.ConnectError("timeout"))
+        client._http = mock_http
+
+        result = await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
+        assert "error" in result
+
+    async def test_special_requests_included(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"confirmationNumber": "OT-SR"}
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        result = await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+            special_requests="Window seat please",
+        )
+        assert result == {"confirmation_number": "OT-SR"}
+        call_args = mock_http.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["specialRequests"] == "Window seat please"
+
+    async def test_special_requests_not_included_when_none(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"confirmationNumber": "OT-NS"}
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
+        call_args = mock_http.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert "specialRequests" not in payload
+
+    async def test_reservation_id_fallback(self, tmp_path):
+        """When confirmationNumber absent, reservationId is used."""
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
+        client._rid_cache["slug"] = 100
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"reservationId": "res-id-123"}
+
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        result = await client.book(
+            "slug", "2026-03-15", "19:00", 2,
+            slot_availability_token="t", slot_hash="h",
+        )
+        assert result == {"confirmation_number": "res-id-123"}
 
 
 # ---- cancel -----------------------------------------------------------------
 
 
 class TestCancel:
-    """cancel: finding and clicking cancel + confirm buttons."""
+    """cancel: DAPI cancel-reservation endpoint."""
 
-    async def test_success_cancel_and_confirm(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-
-        cancel_btn = AsyncMock()
-        cancel_btn.click = AsyncMock()
-        confirm_btn = AsyncMock()
-        confirm_btn.click = AsyncMock()
-
-        page.query_selector.side_effect = [cancel_btn, confirm_btn]
-
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.cancel("OT-12345")
-
-        assert result is True
-        cancel_btn.click.assert_awaited_once()
-        confirm_btn.click.assert_awaited_once()
-
-    async def test_not_logged_in_calls_login(self, tmp_path):
+    async def test_success_returns_true(self, tmp_path):
         store = _make_credential_store(tmp_path)
-        store.save_credentials("opentable", {"email": "u@x.com", "password": "pw"})
-
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-
-        cancel_btn = AsyncMock()
-        cancel_btn.click = AsyncMock()
-        confirm_btn = AsyncMock()
-        confirm_btn.click = AsyncMock()
-
-        page.query_selector.side_effect = [cancel_btn, confirm_btn]
-
+        store.save_credentials("opentable", {"csrf_token": "csrf-abc", "email": "u@t.com"})
         client = OpenTableClient(store)
-        client._browser = browser
-        client._page = page
-        client._pw = pw_instance
 
-        with (
-            patch.object(client, "_login", new_callable=AsyncMock) as mock_login,
-            patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock),
-        ):
-            result = await client.cancel("OT-12345")
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
 
-        mock_login.assert_awaited_once()
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
+
+        result = await client.cancel("OT-12345")
         assert result is True
+        call_args = mock_http.post.call_args
+        payload = call_args.kwargs.get("json") or call_args[1].get("json")
+        assert payload["confirmationNumber"] == "OT-12345"
+        headers = call_args.kwargs.get("headers") or call_args[1].get("headers")
+        assert headers["x-csrf-token"] == "csrf-abc"
 
-    async def test_no_cancel_button_returns_false(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.query_selector.return_value = None  # no cancel button
+    async def test_no_csrf_token_returns_false(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"email": "u@t.com"})
+        client = OpenTableClient(store)
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
-
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.cancel("OT-12345")
-
+        result = await client.cancel("OT-12345")
         assert result is False
 
-    async def test_no_confirm_button_still_returns_true(self, tmp_path):
-        """Cancel button found, but confirm button is None -- still True."""
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
+    async def test_no_credentials_returns_false(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        client = OpenTableClient(store)
 
-        cancel_btn = AsyncMock()
-        cancel_btn.click = AsyncMock()
+        result = await client.cancel("OT-12345")
+        assert result is False
 
-        # First call returns cancel button, second returns None (no confirm)
-        page.query_selector.side_effect = [cancel_btn, None]
+    async def test_non_200_returns_false(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
+        mock_resp = MagicMock()
+        mock_resp.status_code = 400
 
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.cancel("OT-12345")
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(return_value=mock_resp)
+        client._http = mock_http
 
-        assert result is True
-        cancel_btn.click.assert_awaited_once()
+        result = await client.cancel("OT-12345")
+        assert result is False
 
-    async def test_exception_returns_false(self, tmp_path):
-        mock_apw, page, browser, pw_instance = _mock_browser_chain()
-        page.goto.side_effect = RuntimeError("network failure")
+    async def test_http_error_returns_false(self, tmp_path):
+        store = _make_credential_store(tmp_path)
+        store.save_credentials("opentable", {"csrf_token": "tok", "email": "u@t.com"})
+        client = OpenTableClient(store)
 
-        client = _make_client_with_browser(tmp_path, page, browser, pw_instance)
-        client._logged_in = True
+        mock_http = AsyncMock()
+        mock_http.post = AsyncMock(side_effect=httpx.ConnectError("timeout"))
+        client._http = mock_http
 
-        with patch("src.clients.opentable.asyncio.sleep", new_callable=AsyncMock):
-            result = await client.cancel("OT-12345")
-
+        result = await client.cancel("OT-12345")
         assert result is False
