@@ -71,7 +71,7 @@ You will be prompted for:
 - **Google API Key** (required) — Google Cloud Console → Places API (New)
 - **OpenWeather API Key** (optional) — openweathermap.org (free tier: 1000/day)
 - **Resy credentials** (optional) — for automated Resy booking
-- **OpenTable credentials** (optional) — for automated OpenTable booking
+- **OpenTable session** (optional) — CSRF token + browser cookies for OpenTable booking
 
 The script outputs a ready-to-paste Claude Desktop config with a single `RESTAURANT_MCP_KEY` env var. No `.env` file needed.
 
@@ -116,8 +116,8 @@ OPENWEATHER_API_KEY=your_openweather_key
 # Optional — booking credentials
 RESY_EMAIL=me@example.com
 RESY_PASSWORD=mypassword
-OPENTABLE_EMAIL=me@example.com
-OPENTABLE_PASSWORD=mypassword
+OPENTABLE_CSRF_TOKEN=your_csrf_token
+OPENTABLE_COOKIES=your_cookie_header
 ```
 
 In legacy mode, the Claude Desktop config needs only the command — no `env` block required, since `.env` in the `cwd` is loaded automatically:
@@ -226,7 +226,7 @@ python -m src.setup
 | **Encryption at rest** | Fernet (AES-128-CBC) via PBKDF2-derived key; all config in SQLite `app_config` table |
 | **Legacy mode** | `.env` file + OS keyring/file-based Fernet key still supported |
 | **Resy password** | NOT persisted after authentication — only email + auth token stored |
-| **OpenTable password** | Stored encrypted (required for every Playwright session) |
+| **OpenTable session** | CSRF token + browser cookies stored encrypted; no password needed |
 | **File permissions** | Credentials dir 0o700, all files 0o600 |
 
 Install the optional `keyring` dependency for OS keyring support (legacy mode):

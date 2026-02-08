@@ -63,13 +63,12 @@ class TestRunSetup:
             "test-google-key",     # google api key
             "test-weather-key",    # openweather api key
             "resy-pw",             # resy password
-            "ot-pw",               # opentable password
         ])
         text_inputs = iter([
             "resy@test.com",       # resy email
-            "ot@test.com",         # opentable email
             "csrf-token-abc",      # opentable csrf token
             "session=xyz123",      # opentable cookies
+            "ot@test.com",         # opentable email
         ])
 
         with (
@@ -91,10 +90,9 @@ class TestRunSetup:
             assert await store.get("openweather_api_key") == "test-weather-key"
             assert await store.get("resy_email") == "resy@test.com"
             assert await store.get("resy_password") == "resy-pw"
-            assert await store.get("opentable_email") == "ot@test.com"
-            assert await store.get("opentable_password") == "ot-pw"
             assert await store.get("opentable_csrf_token") == "csrf-token-abc"
             assert await store.get("opentable_cookies") == "session=xyz123"
+            assert await store.get("opentable_email") == "ot@test.com"
 
     async def test_optional_fields_skipped(self, tmp_path):
         data_dir = tmp_path / "data"
@@ -104,7 +102,7 @@ class TestRunSetup:
         ])
         text_inputs = iter([
             "",                 # resy email — skip
-            "",                 # opentable email — skip
+            "",                 # opentable csrf token — skip
         ])
 
         with (
@@ -122,10 +120,9 @@ class TestRunSetup:
             assert await store.has("openweather_api_key") is False
             assert await store.has("resy_email") is False
             assert await store.has("resy_password") is False
-            assert await store.has("opentable_email") is False
-            assert await store.has("opentable_password") is False
             assert await store.has("opentable_csrf_token") is False
             assert await store.has("opentable_cookies") is False
+            assert await store.has("opentable_email") is False
 
     async def test_prints_claude_config(self, tmp_path, capsys):
         data_dir = tmp_path / "data"
@@ -135,7 +132,7 @@ class TestRunSetup:
         ])
         text_inputs = iter([
             "",   # skip resy
-            "",   # skip opentable
+            "",   # skip opentable csrf
         ])
 
         with (

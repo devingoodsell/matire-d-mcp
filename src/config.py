@@ -34,7 +34,8 @@ class Settings(BaseSettings):
     resy_email: str | None = None
     resy_password: str | None = None
     opentable_email: str | None = None
-    opentable_password: str | None = None
+    opentable_csrf_token: str | None = None
+    opentable_cookies: str | None = None
 
     # Paths & logging — default is <project_root>/data so it works
     # regardless of the process working directory (Claude Desktop may

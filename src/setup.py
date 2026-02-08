@@ -51,20 +51,18 @@ async def _run_setup(data_dir: Path) -> None:
         resy_password = _prompt("Resy password", secret=True)
 
     print()
-    ot_email = _prompt("OpenTable email", required=False)
-    ot_password = ""
-    ot_csrf = ""
+    print("  OpenTable requires browser session cookies for API access.")
+    print("  To get them: log in at opentable.com, open DevTools (F12),")
+    print("  Network tab, find any POST to /dapi/ and copy the")
+    print("  x-csrf-token header, then copy the Cookie header from any")
+    print("  request to www.opentable.com.")
+    print()
+    ot_csrf = _prompt("OpenTable x-csrf-token", required=False)
     ot_cookies = ""
-    if ot_email:
-        ot_password = _prompt("OpenTable password", secret=True)
-        print()
-        print("  OpenTable requires browser session cookies for API access.")
-        print("  To get them: log in at opentable.com, open DevTools (F12),")
-        print("  Network tab, click any request to www.opentable.com, then")
-        print("  copy the Cookie header and x-csrf-token header values.")
-        print()
-        ot_csrf = _prompt("OpenTable x-csrf-token", required=False)
+    ot_email = ""
+    if ot_csrf:
         ot_cookies = _prompt("OpenTable Cookie header", required=False)
+        ot_email = _prompt("OpenTable email (for booking contact info)", required=False)
 
     # ── Generate master key ──────────────────────────────────────────
     master_key = _generate_master_key()
@@ -93,8 +91,6 @@ async def _run_setup(data_dir: Path) -> None:
             await store.set("resy_password", resy_password)
         if ot_email:
             await store.set("opentable_email", ot_email)
-        if ot_password:
-            await store.set("opentable_password", ot_password)
         if ot_csrf:
             await store.set("opentable_csrf_token", ot_csrf)
         if ot_cookies:

@@ -33,18 +33,21 @@ class TestSettings:
         assert s.resy_email is None
         assert s.resy_password is None
         assert s.opentable_email is None
-        assert s.opentable_password is None
+        assert s.opentable_csrf_token is None
+        assert s.opentable_cookies is None
 
     def test_credential_fields_from_env(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("RESY_EMAIL", "resy@test.com")
         monkeypatch.setenv("RESY_PASSWORD", "resy-pw")
         monkeypatch.setenv("OPENTABLE_EMAIL", "ot@test.com")
-        monkeypatch.setenv("OPENTABLE_PASSWORD", "ot-pw")
+        monkeypatch.setenv("OPENTABLE_CSRF_TOKEN", "csrf-abc")
+        monkeypatch.setenv("OPENTABLE_COOKIES", "sid=xyz")
         s = Settings(_env_file=None)
         assert s.resy_email == "resy@test.com"
         assert s.resy_password == "resy-pw"
         assert s.opentable_email == "ot@test.com"
-        assert s.opentable_password == "ot-pw"
+        assert s.opentable_csrf_token == "csrf-abc"
+        assert s.opentable_cookies == "sid=xyz"
 
     def test_default_data_dir(self, monkeypatch: pytest.MonkeyPatch):
         s = Settings()
