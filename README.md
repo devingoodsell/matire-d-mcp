@@ -1,6 +1,6 @@
-# NYC Restaurant Reservation Assistant
+# Maître d'MCP
 
-An MCP-based personal assistant that discovers restaurants, checks availability, and books reservations through natural conversation with Claude.
+An MCP-based that provides a set of tools to discover restaurants, checks availability, and books reservations through natural conversation with chat agents that integrate with MCP.
 
 > **Note:** Three MCP servers for Resy reservations already exist in the ecosystem ([see Prior Art](#prior-art)), but none combine Google Places discovery, weather integration, dining companion tracking, and real booking across both Resy **and** OpenTable — that gap is this project's value proposition.
 
@@ -14,10 +14,10 @@ Claude: I found 3 Italian spots within 10 min walk of your home:
         2. L'Artusi (4.5★) - 7:00 PM on OpenTable
         3. Via Carota (4.6★) - 8:45 PM on Resy
 
-        Your wife has a nut allergy - I've verified these don't
+        Your wife has a peanut allergy - I've verified these don't
         have nut-heavy menus. Which would you like?
 
-You: "Carbone at 6:30"
+You: "L'Artusi at 6:30"
 
 Claude: ✓ Booked! Carbone, Saturday 6:30 PM, 2 people
         Confirmation: RESY-ABC123
