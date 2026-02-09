@@ -16,13 +16,29 @@ import aiosqlite
 from src.storage.config_store import ConfigStore, derive_fernet_key  # noqa: F401
 
 
+def _read_file_value(path_str: str) -> str:
+    """Read a value from a file path (strips whitespace)."""
+    p = Path(path_str).expanduser()
+    if not p.is_file():
+        print(f"  File not found: {p}")
+        return ""
+    return p.read_text().strip()
+
+
 def _prompt(label: str, *, secret: bool = False, required: bool = True) -> str:
-    """Prompt the user for input (optionally hidden)."""
+    """Prompt the user for input (optionally hidden).
+
+    Values prefixed with ``@`` are treated as file paths — the file
+    contents are read and used as the value.  This is useful for long
+    values (e.g. cookie headers) that exceed the terminal line buffer.
+    """
     suffix = "" if required else " (optional, press Enter to skip)"
     prompt_text = f"{label}{suffix}: "
     while True:
         value = getpass.getpass(prompt_text) if secret else input(prompt_text)
         value = value.strip()
+        if value.startswith("@"):
+            value = _read_file_value(value[1:])
         if value or not required:
             return value
         print(f"  {label} is required.")
@@ -57,11 +73,13 @@ async def _run_setup(data_dir: Path) -> None:
     print("  x-csrf-token header, then copy the Cookie header from any")
     print("  request to www.opentable.com.")
     print()
+    print("  Tip: For long values, save to a file and enter @path/to/file")
+    print()
     ot_csrf = _prompt("OpenTable x-csrf-token", required=False)
     ot_cookies = ""
     ot_email = ""
     if ot_csrf:
-        ot_cookies = _prompt("OpenTable Cookie header", required=False)
+        ot_cookies = _prompt("OpenTable Cookie header (or @path/to/file)", required=False)
         ot_email = _prompt("OpenTable email (for booking contact info)", required=False)
 
     # ── Generate master key ──────────────────────────────────────────

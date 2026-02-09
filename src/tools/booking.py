@@ -574,7 +574,14 @@ def register_booking_tools(mcp: FastMCP) -> None:  # noqa: C901
             ot_client = OpenTableClient(credential_store=store)
             try:
                 conf_id = res.platform_confirmation_id or res.id or ""
-                success = await ot_client.cancel(conf_id)
+                # Resolve the numeric rid for the mobile API cancel
+                rid: int | None = None
+                cached = await db.get_cached_restaurant(res.restaurant_id)
+                if cached and cached.opentable_id:
+                    rid = await ot_client._resolve_restaurant_id(
+                        cached.opentable_id,
+                    )
+                success = await ot_client.cancel(conf_id, rid=rid)
             finally:
                 await ot_client.close()
 

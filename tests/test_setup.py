@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import aiosqlite
 
-from src.setup import _generate_master_key, _prompt, _run_setup, main
+from src.setup import _generate_master_key, _prompt, _read_file_value, _run_setup, main
 from src.storage.config_store import ConfigStore, derive_fernet_key
 
 
@@ -54,6 +54,46 @@ class TestPrompt:
         with patch("getpass.getpass", return_value="secret-pw"):
             result = _prompt("Password", secret=True)
         assert result == "secret-pw"
+
+
+class TestReadFileValue:
+    def test_reads_file_contents(self, tmp_path):
+        f = tmp_path / "cookie.txt"
+        f.write_text("  long-cookie-value  \n")
+        assert _read_file_value(str(f)) == "long-cookie-value"
+
+    def test_returns_empty_for_missing_file(self, capsys):
+        result = _read_file_value("/nonexistent/file.txt")
+        assert result == ""
+        captured = capsys.readouterr()
+        assert "File not found" in captured.out
+
+    def test_expands_tilde(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HOME", str(tmp_path))
+        f = tmp_path / "val.txt"
+        f.write_text("home-value")
+        assert _read_file_value("~/val.txt") == "home-value"
+
+
+class TestPromptFileInput:
+    def test_at_prefix_reads_from_file(self, tmp_path):
+        f = tmp_path / "token.txt"
+        f.write_text("file-token-value")
+        with patch("builtins.input", return_value=f"@{f}"):
+            result = _prompt("Token")
+        assert result == "file-token-value"
+
+    def test_at_prefix_missing_file_reprompts(self, tmp_path, capsys):
+        good_file = tmp_path / "good.txt"
+        good_file.write_text("ok")
+        with patch("builtins.input", side_effect=["@/bad/path.txt", f"@{good_file}"]):
+            result = _prompt("Token")
+        assert result == "ok"
+
+    def test_at_prefix_optional_missing_file_returns_empty(self):
+        with patch("builtins.input", return_value="@/nonexistent.txt"):
+            result = _prompt("Token", required=False)
+        assert result == ""
 
 
 class TestRunSetup:

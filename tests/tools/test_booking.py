@@ -1956,7 +1956,9 @@ class TestCancelReservation:
         text = str(result)
         assert "Cancelled" in text
         assert "Carbone" in text
-        mock_ot_client.cancel.assert_called_once_with("OT-CANCEL-123")
+        mock_ot_client.cancel.assert_called_once_with(
+            "OT-CANCEL-123", rid=None,
+        )
         mock_ot_client.close.assert_awaited_once()
 
     async def test_cancel_opentable_fails(self, booking_mcp):
@@ -2017,7 +2019,53 @@ class TestCancelReservation:
                 )
         text = str(result)
         assert "Cancelled" in text
-        mock_ot_client.cancel.assert_called_once_with("ot-local-id")
+        mock_ot_client.cancel.assert_called_once_with(
+            "ot-local-id", rid=None,
+        )
+
+    async def test_cancel_opentable_resolves_rid_from_cache(self, booking_mcp):
+        """When restaurant is cached with opentable_id, rid is resolved."""
+        mcp, db, _store, _auth = booking_mcp
+        restaurant = make_restaurant(
+            id="place_carbone",
+            name="Carbone",
+            opentable_id="carbone-new-york",
+        )
+        await db.cache_restaurant(restaurant)
+        reservation = make_reservation(
+            restaurant_id="place_carbone",
+            restaurant_name="Carbone",
+            date="2099-12-31",
+            time="19:00",
+            platform=BookingPlatform.OPENTABLE,
+            platform_confirmation_id="OT-RID-TEST",
+        )
+        await db.save_reservation(reservation)
+
+        mock_ot_client = AsyncMock()
+        mock_ot_client._resolve_restaurant_id = AsyncMock(
+            return_value=8033,
+        )
+        mock_ot_client.cancel.return_value = True
+        mock_ot_client.close = AsyncMock()
+
+        with patch(
+            "src.clients.opentable.OpenTableClient",
+            return_value=mock_ot_client,
+        ):
+            async with Client(mcp) as client:
+                result = await client.call_tool(
+                    "cancel_reservation",
+                    {"restaurant_name": "Carbone"},
+                )
+        text = str(result)
+        assert "Cancelled" in text
+        mock_ot_client._resolve_restaurant_id.assert_called_once_with(
+            "carbone-new-york",
+        )
+        mock_ot_client.cancel.assert_called_once_with(
+            "OT-RID-TEST", rid=8033,
+        )
 
     async def test_cancel_resy_reservation_success(self, booking_mcp):
         """Cancel a Resy reservation — default path."""

@@ -58,7 +58,7 @@ pip install -e ".[dev]"
 playwright install chromium
 ```
 
-### 3. Run Setup (Recommended)
+### 3. Run Setup
 
 The interactive setup encrypts all secrets into the local database and generates your Claude Desktop config:
 
@@ -73,7 +73,30 @@ You will be prompted for:
 - **Resy credentials** (optional) — for automated Resy booking
 - **OpenTable session** (optional) — CSRF token + browser cookies for OpenTable booking
 
-The script outputs a ready-to-paste Claude Desktop config with a single `RESTAURANT_MCP_KEY` env var. No `.env` file needed.
+The script outputs a ready-to-paste Claude Desktop config with a single `RESTAURANT_MCP_KEY` env var.
+
+<details>
+<summary><b>Extracting OpenTable Session Values</b></summary>
+
+OpenTable's API requires authenticated browser session cookies to bypass bot protection. Without this step, OpenTable availability checks and bookings will fail.
+
+During `python -m src.setup`, when you provide an OpenTable email you'll be prompted for:
+- **OpenTable x-csrf-token** — from browser DevTools
+- **OpenTable Cookie header** — from browser DevTools
+
+**How to get these values (re-run setup when cookies expire, typically every few days):**
+
+1. Open https://www.opentable.com in Chrome and **log in**
+2. Open DevTools (`Cmd+Option+I` on macOS, `F12` on Windows)
+3. Go to the **Network** tab
+4. Navigate to any restaurant page (e.g. search for "Carbone" and click it)
+5. In the Network list, click any request to `www.opentable.com`
+6. Find any request to a `/dapi/` endpoint (POST) and copy the **`x-csrf-token`** header value
+7. In the **Headers** tab, copy the full **`Cookie`** header value
+8. Save the cookie value into a temp file that can be referenced in the `src.setup` command. This is due to the paste size being too large.
+
+> **Why is this needed?** OpenTable uses Cloudflare bot protection that blocks plain HTTP requests. By storing your browser's session cookies, the MCP server can make API calls as your authenticated session. The cookies are encrypted at rest using the same Fernet encryption as all other credentials.
+</details>
 
 ### 4. Configure Claude Desktop
 
@@ -100,41 +123,6 @@ The config should look like:
 ```
 
 Replace paths with the actual paths from the setup output.
-
-<details>
-<summary><b>Alternative: .env file (legacy mode)</b></summary>
-
-If you prefer not to use the setup script, create a `.env` file manually:
-
-```bash
-# Required — Google Cloud Console → APIs & Services → Places API (New)
-GOOGLE_API_KEY=your_google_api_key
-
-# Optional — openweathermap.org (free tier: 1000 calls/day)
-OPENWEATHER_API_KEY=your_openweather_key
-
-# Optional — booking credentials
-RESY_EMAIL=me@example.com
-RESY_PASSWORD=mypassword
-OPENTABLE_CSRF_TOKEN=your_csrf_token
-OPENTABLE_COOKIES=your_cookie_header
-```
-
-In legacy mode, the Claude Desktop config needs only the command — no `env` block required, since `.env` in the `cwd` is loaded automatically:
-
-```json
-{
-  "mcpServers": {
-    "restaurant": {
-      "command": "/path/to/restaurant-mcp/.venv/bin/python",
-      "args": ["-m", "src"],
-      "cwd": "/path/to/restaurant-mcp"
-    }
-  }
-}
-```
-
-</details>
 
 ### 5. Restart Claude Desktop
 
@@ -178,44 +166,6 @@ You: "Create a group called 'date night' with my wife"
 
 Claude: ✓ Group 'date night' created. Merged restrictions: nut allergy, seed allergy.
 ```
-
-### 8. Store Booking Credentials
-
-If you provided Resy/OpenTable credentials during `python -m src.setup`, they are already encrypted in the database. Just tell Claude:
-
-```
-You: "Set up my Resy account for booking"
-
-Claude: ✓ Resy credentials saved and validated!
-```
-
-If you skipped booking credentials during setup, you can add them later via env vars in `.env` or by passing them as tool arguments (note: arguments are visible in chat history).
-
-### 9. Set Up OpenTable Session (Required for OpenTable Booking)
-
-OpenTable's API requires authenticated browser session cookies to bypass bot protection. Without this step, OpenTable availability checks and bookings will fail.
-
-During `python -m src.setup` (step 3), when you provide an OpenTable email you'll be prompted for:
-- **OpenTable x-csrf-token** — from browser DevTools
-- **OpenTable Cookie header** — from browser DevTools
-
-**How to get these values (re-run setup when cookies expire, typically every few days):**
-
-1. Open https://www.opentable.com in Chrome and **log in**
-2. Open DevTools (`Cmd+Option+I` on macOS, `F12` on Windows)
-3. Go to the **Network** tab
-4. Navigate to any restaurant page (e.g. search for "Carbone" and click it)
-5. In the Network list, click any request to `www.opentable.com`
-6. In the **Headers** tab, copy the full **`Cookie`** header value
-7. Find any request to a `/dapi/` endpoint (POST) and copy the **`x-csrf-token`** header value
-8. Re-run setup to update the stored values:
-
-```bash
-source .venv/bin/activate
-python -m src.setup
-```
-
-> **Why is this needed?** OpenTable uses Cloudflare bot protection that blocks plain HTTP requests. By storing your browser's session cookies, the MCP server can make API calls as your authenticated session. The cookies are encrypted at rest using the same Fernet encryption as all other credentials.
 
 ### Security Model
 
