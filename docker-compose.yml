@@ -1,0 +1,28 @@
+services:
+  mcp:
+    build: .
+    volumes:
+      - ./data:/app/data
+    environment:
+      - MCP_TRANSPORT=streamable-http
+      - MCP_HOST=0.0.0.0
+      - MCP_PORT=8000
+      - MCP_AUTH_TOKEN=${MCP_AUTH_TOKEN}
+      - RESTAURANT_MCP_KEY=${RESTAURANT_MCP_KEY}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
+    restart: unless-stopped
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      mcp:
+        condition: service_healthy
+    restart: unless-stopped

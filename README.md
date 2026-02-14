@@ -38,6 +38,7 @@ Claude: ✓ Booked! Carbone, Saturday 6:30 PM, 2 people
 | **Calendar Sync** | Add reservations to Google Calendar with one click |
 | **Cost Tracking** | Monitor your API usage costs |
 | **Resilient** | Retry with backoff, circuit breakers, graceful fallbacks |
+| **Remote Hosting** | Docker + Cloudflare Tunnel for access from any device over HTTPS |
 
 ## Quick Start
 
@@ -124,11 +125,53 @@ The config should look like:
 
 Replace paths with the actual paths from the setup output.
 
-### 5. Restart Claude Desktop
+### 5. (Optional) Remote Hosting via Docker
+
+For access from Claude.ai, Claude Code, or mobile — run the server on a home server / NAS / Raspberry Pi:
+
+```bash
+# Copy env template and fill in values from setup
+cp .env.example .env
+# Edit .env — add MCP_AUTH_TOKEN, RESTAURANT_MCP_KEY, and TUNNEL_TOKEN
+
+# Build and start
+docker compose up --build -d
+
+# Verify
+curl http://localhost:8000/health
+# → {"status":"ok"}
+```
+
+Then configure Claude Desktop for remote access:
+
+```json
+{
+  "mcpServers": {
+    "restaurant": {
+      "url": "https://mcp.yourdomain.com/mcp",
+      "headers": {
+        "Authorization": "Bearer YOUR_MCP_AUTH_TOKEN"
+      }
+    }
+  }
+}
+```
+
+Or Claude Code:
+
+```bash
+claude mcp add restaurant --transport streamable-http \
+  --url https://mcp.yourdomain.com/mcp \
+  --header "Authorization: Bearer YOUR_TOKEN"
+```
+
+See [Remote Hosting Spec](./docs/specs/remote-hosting.md) for full Cloudflare Tunnel setup instructions.
+
+### 6. Restart Claude Desktop
 
 Quit and reopen Claude Desktop. You should see the restaurant tools available (hammer icon in the chat input).
 
-### 6. First Run — Set Up Your Profile
+### 7. First Run — Set Up Your Profile
 
 Start a conversation with Claude:
 
@@ -155,7 +198,7 @@ You: "None for me"
 Claude: ✓ Profile saved! You're all set.
 ```
 
-### 7. Add Dining Companions
+### 8. Add Dining Companions
 
 ```
 You: "Add my wife — she has a nut allergy and a seed allergy"
@@ -262,10 +305,13 @@ Use `api_costs` to monitor your spending at any time.
 
 - **Language:** Python 3.11+
 - **Framework:** [FastMCP](https://gofastmcp.com) — auto-generates tool schemas from type hints
+- **Transport:** stdio (local) or streamable-http (remote hosting)
 - **Storage:** SQLite (local, WAL mode) with aiosqlite
+- **Auth:** Bearer token via FastMCP's `TokenVerifier` (constant-time comparison)
 - **Browser Automation:** Playwright (for auth + OpenTable)
 - **APIs:** Google Places (New), OpenWeatherMap, Resy (unofficial), OpenTable (automation)
 - **Calendar:** Google Calendar URL generation (zero-config)
+- **Containerization:** Docker + Cloudflare Tunnel for remote hosting
 - **Resilience:** tenacity (retry), custom CircuitBreaker, InMemoryCache (LRU + TTL)
 
 ### Resilience Features
@@ -291,15 +337,18 @@ restaurant-mcp/
 │   ├── test.sh                  # Run tests with coverage
 │   └── lint.sh                  # Ruff linting only
 ├── src/
-│   ├── server.py                # FastMCP entry point
+│   ├── server.py                # FastMCP entry point + health endpoint
+│   ├── auth.py                  # Bearer token verifier for remote access
 │   ├── config.py                # Environment configuration
 │   ├── models/                  # Pydantic data models
 │   ├── storage/                 # SQLite + encrypted credentials
 │   ├── clients/                 # API clients + resilience + cache
 │   ├── matching/                # Cross-platform venue ID resolution
 │   └── tools/                   # MCP tool definitions
-├── tests/                       # 1112 tests, 100% branch coverage
+├── tests/                       # 1193 tests, 100% branch coverage
 ├── data/                        # Runtime: DB, logs, credentials (gitignored)
+├── Dockerfile                   # Container build for remote hosting
+├── docker-compose.yml           # MCP + Cloudflare Tunnel orchestration
 ├── pyproject.toml
 ├── .env.example
 └── README.md
@@ -321,7 +370,7 @@ bash scripts/test.sh
 bash scripts/lint.sh
 ```
 
-**Testing:** 1112 unit tests with 100% branch coverage (`fail_under = 100` enforced).
+**Testing:** 1193 unit tests with 100% branch coverage (`fail_under = 100` enforced).
 
 ### Integration Tests
 
@@ -366,6 +415,7 @@ Several MCP restaurant reservation servers already exist — these serve as refe
 | [EPICS-INDEX.md](./docs/specs/EPICS-INDEX.md) | Master EPIC guide — dependency graph, tool inventory |
 | [ARCHITECTURE_PLAN.md](./docs/specs/ARCHITECTURE_PLAN.md) | High-level architecture, API landscape, data models |
 | [ADR-001](./docs/adr/001-epic08-resilience-decisions.md) | EPIC-08 resilience implementation decisions |
+| [ADR-004](./docs/adr/004-remote-hosting.md) | Remote hosting: Docker, streamable-http, bearer auth |
 
 ## Risks & Mitigations
 
@@ -396,4 +446,4 @@ The **NY Restaurant Reservation Anti-Piracy Act** (S.9365A, effective February 2
 
 ---
 
-**Status:** All 8 EPICs complete. 1112 tests, 100% branch coverage. Integration tests for Resy and OpenTable.
+**Status:** All 8 EPICs complete. Remote hosting via Docker + Cloudflare Tunnel. 1193 tests, 100% branch coverage. Integration tests for Resy and OpenTable.

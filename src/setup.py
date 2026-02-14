@@ -118,6 +118,11 @@ async def _run_setup(data_dir: Path) -> None:
     print("All credentials encrypted and stored in", db_path)
     print()
 
+    # ── Generate auth token for remote hosting ───────────────────────
+    import secrets
+
+    auth_token = secrets.token_urlsafe(48)
+
     # ── Print Claude Desktop config ──────────────────────────────────
     project_dir = Path(__file__).resolve().parent.parent
     venv_python = project_dir / ".venv" / "bin" / "python"
@@ -135,9 +140,16 @@ async def _run_setup(data_dir: Path) -> None:
         }
     }
 
-    print("Add this to your Claude Desktop config:")
+    print("Add this to your Claude Desktop config (local stdio mode):")
     print()
     print(json.dumps(config, indent=2))
+    print()
+
+    print("=" * 40)
+    print("For remote hosting, add these to your .env file:")
+    print()
+    print(f"  RESTAURANT_MCP_KEY={master_key}")
+    print(f"  MCP_AUTH_TOKEN={auth_token}")
     print()
 
 

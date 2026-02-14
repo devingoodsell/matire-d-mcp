@@ -1,5 +1,7 @@
 # Runtime data
 data/restaurant.db
+data/restaurant.db-shm
+data/restaurant.db-wal
 data/.credentials/
 data/logs/
 
@@ -35,6 +37,9 @@ htmlcov/
 
 # Linting
 .ruff_cache/
+
+# Docker
+.docker/
 
 # OS
 .DS_Store

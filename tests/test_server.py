@@ -119,6 +119,34 @@ class TestInitialize:
         assert any(isinstance(h, RotatingFileHandler) for h in root.handlers)
 
 
+    def test_sets_auth_when_token_configured(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.setenv("MCP_AUTH_TOKEN", "a" * 48)
+        result = initialize()
+        from src.auth import BearerTokenVerifier
+
+        assert isinstance(result.auth, BearerTokenVerifier)
+
+    def test_no_auth_without_token(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("DATA_DIR", str(tmp_path))
+        monkeypatch.delenv("MCP_AUTH_TOKEN", raising=False)
+        # Reset mcp.auth to a known state before test
+        mcp.auth = None
+        result = initialize()
+        assert result.auth is None
+
+
+class TestHealthCheck:
+    """Test the /health custom route handler."""
+
+    async def test_health_returns_ok(self):
+        from src.server import health_check
+
+        response = await health_check(None)
+        assert response.status_code == 200
+        assert response.body == b'{"status":"ok"}'
+
+
 class TestAppLifespan:
     """Test the async database lifecycle."""
 

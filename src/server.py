@@ -83,6 +83,14 @@ async def app_lifespan(server: FastMCP) -> AsyncIterator[dict]:
 mcp = FastMCP("restaurant-assistant", lifespan=app_lifespan)
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(request):  # noqa: ARG001
+    """Unauthenticated health endpoint for Docker / load-balancer probes."""
+    from starlette.responses import JSONResponse
+
+    return JSONResponse({"status": "ok"})
+
+
 def setup_logging(log_level: str, data_dir: Path) -> None:
     """Configure logging with file rotation and console output.
 
@@ -134,6 +142,13 @@ def initialize() -> FastMCP:
 
     # Logging
     setup_logging(settings.log_level, settings.data_dir)
+
+    # Conditional auth for remote hosting
+    if settings.mcp_auth_token:
+        from src.auth import BearerTokenVerifier
+
+        mcp.auth = BearerTokenVerifier(settings.mcp_auth_token)
+        logger.info("Bearer token auth enabled")
 
     # Register tools
     from src.tools.blacklist import register_blacklist_tools

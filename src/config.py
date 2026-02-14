@@ -37,6 +37,12 @@ class Settings(BaseSettings):
     opentable_csrf_token: str | None = None
     opentable_cookies: str | None = None
 
+    # Remote hosting — transport, bind address, and auth
+    mcp_transport: str = "stdio"
+    mcp_host: str = "0.0.0.0"
+    mcp_port: int = 8000
+    mcp_auth_token: str | None = None
+
     # Paths & logging — default is <project_root>/data so it works
     # regardless of the process working directory (Claude Desktop may
     # spawn the server from a read-only location).
