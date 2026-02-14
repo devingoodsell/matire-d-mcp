@@ -12,6 +12,7 @@ from src.models.user import (
     PricePreference,
     UserPreferences,
 )
+from src.models.wishlist import WishlistItem
 
 
 def make_restaurant(**overrides: object) -> Restaurant:
@@ -131,6 +132,15 @@ def make_booking_result(**overrides: object) -> BookingResult:
     }
     defaults.update(overrides)
     return BookingResult(**defaults)
+
+
+def make_wishlist_item(**overrides: object) -> WishlistItem:
+    defaults: dict = {
+        "restaurant_id": f"place_{uuid4().hex[:8]}",
+        "restaurant_name": "Test Wishlist Restaurant",
+    }
+    defaults.update(overrides)
+    return WishlistItem(**defaults)
 
 
 def make_availability_result(**overrides: object) -> AvailabilityResult:

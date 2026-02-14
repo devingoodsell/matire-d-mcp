@@ -148,6 +148,6 @@ def _session_finalizer(request):
                     pass
             await ot_client_cleanup.close()
 
-        asyncio.get_event_loop().run_until_complete(_do_cleanup())
+        asyncio.run(_do_cleanup())
 
     request.addfinalizer(_finalise)

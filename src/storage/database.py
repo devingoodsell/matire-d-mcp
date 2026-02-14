@@ -22,6 +22,7 @@ from src.models.user import (
     PricePreference,
     UserPreferences,
 )
+from src.models.wishlist import WishlistItem
 
 logger = logging.getLogger(__name__)
 
@@ -731,6 +732,95 @@ class DatabaseManager:
         await self.execute(
             "DELETE FROM blacklist WHERE restaurant_id = ?", (restaurant_id,)
         )
+
+    # ── Wishlist ─────────────────────────────────────────────────────────
+
+    async def add_to_wishlist(
+        self,
+        restaurant_id: str,
+        restaurant_name: str,
+        notes: str | None,
+        tags: list[str],
+    ) -> int:
+        """Upsert a restaurant onto the wishlist and replace its tags.
+
+        Returns the wishlist row id.
+        """
+        assert self.connection is not None
+        await self.connection.execute(
+            """INSERT INTO wishlist (restaurant_id, restaurant_name, notes)
+               VALUES (?, ?, ?)
+               ON CONFLICT(restaurant_id) DO UPDATE SET
+                   notes = excluded.notes""",
+            (restaurant_id, restaurant_name, notes),
+        )
+        await self.connection.commit()
+        row = await self.fetch_one(
+            "SELECT id FROM wishlist WHERE restaurant_id = ?", (restaurant_id,)
+        )
+        assert row is not None
+        wishlist_id: int = row["id"]
+        await self.connection.execute(
+            "DELETE FROM wishlist_tags WHERE wishlist_id = ?", (wishlist_id,)
+        )
+        for tag in tags:
+            await self.connection.execute(
+                "INSERT INTO wishlist_tags (wishlist_id, tag) VALUES (?, ?)",
+                (wishlist_id, tag.lower()),
+            )
+        await self.connection.commit()
+        return wishlist_id
+
+    async def remove_from_wishlist(self, restaurant_id: str) -> bool:
+        """Remove a restaurant from the wishlist. Returns True if a row was deleted."""
+        cursor = await self.execute(
+            "DELETE FROM wishlist WHERE restaurant_id = ?", (restaurant_id,)
+        )
+        return cursor.rowcount > 0
+
+    async def get_wishlist(self, tag: str | None = None) -> list[WishlistItem]:
+        """Return all wishlist items, optionally filtered by tag."""
+        if tag:
+            rows = await self.fetch_all(
+                """SELECT DISTINCT w.* FROM wishlist w
+                   JOIN wishlist_tags wt ON w.id = wt.wishlist_id
+                   WHERE wt.tag = ?
+                   ORDER BY w.added_date DESC""",
+                (tag.lower(),),
+            )
+        else:
+            rows = await self.fetch_all(
+                "SELECT * FROM wishlist ORDER BY added_date DESC"
+            )
+        items: list[WishlistItem] = []
+        for r in rows:
+            tag_rows = await self.fetch_all(
+                "SELECT tag FROM wishlist_tags WHERE wishlist_id = ?",
+                (r["id"],),
+            )
+            items.append(
+                WishlistItem(
+                    id=r["id"],
+                    restaurant_id=r["restaurant_id"],
+                    restaurant_name=r["restaurant_name"],
+                    notes=r["notes"],
+                    tags=[t["tag"] for t in tag_rows],
+                    added_date=r["added_date"],
+                )
+            )
+        return items
+
+    async def is_on_wishlist(self, restaurant_id: str) -> bool:
+        """Check whether a restaurant is on the wishlist."""
+        row = await self.fetch_one(
+            "SELECT 1 FROM wishlist WHERE restaurant_id = ?", (restaurant_id,)
+        )
+        return row is not None
+
+    async def get_wishlist_restaurant_ids(self) -> set[str]:
+        """Return all wishlist restaurant IDs (optimized for scoring hot path)."""
+        rows = await self.fetch_all("SELECT restaurant_id FROM wishlist")
+        return {r["restaurant_id"] for r in rows}
 
     # ── API Call Logging ──────────────────────────────────────────────────
 

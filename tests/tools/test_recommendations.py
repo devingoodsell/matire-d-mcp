@@ -242,6 +242,31 @@ class TestScoreRestaurant:
         )
         assert reason == "Nearby option"
 
+    async def test_wishlist_boost(self):
+        r = make_restaurant(id="wish_place", rating=4.0, lat=40.71, lng=-74.01)
+        score_with, reason_with = await _score_restaurant(
+            r, 40.71, -74.01, None, set(), set(), set(), {}, {},
+            wishlist_ids={"wish_place"},
+        )
+        score_without, _ = await _score_restaurant(
+            r, 40.71, -74.01, None, set(), set(), set(), {}, {},
+        )
+        assert score_with - score_without == pytest.approx(15.0, abs=0.1)
+        assert "On your wishlist" in reason_with
+
+    async def test_no_wishlist_boost(self):
+        r = make_restaurant(id="other_place", rating=4.0, lat=40.71, lng=-74.01)
+        score, reason = await _score_restaurant(
+            r, 40.71, -74.01, None, set(), set(), set(), {}, {},
+            wishlist_ids={"wish_place"},
+        )
+        assert "wishlist" not in reason.lower()
+        # Score should be the same as without wishlist_ids
+        score_base, _ = await _score_restaurant(
+            r, 40.71, -74.01, None, set(), set(), set(), {}, {},
+        )
+        assert score == pytest.approx(score_base, abs=0.1)
+
 
 # ── get_recommendations ──────────────────────────────────────────────────
 

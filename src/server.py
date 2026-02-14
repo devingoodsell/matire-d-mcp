@@ -151,6 +151,10 @@ def initialize() -> FastMCP:
     register_people_tools(mcp)
     register_group_tools(mcp)
     register_blacklist_tools(mcp)
+
+    from src.tools.wishlist import register_wishlist_tools
+
+    register_wishlist_tools(mcp)
     register_booking_tools(mcp)
     register_history_tools(mcp)
     register_recommendation_tools(mcp)

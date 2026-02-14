@@ -56,6 +56,8 @@ class TestCoreMethods:
             "dish_reviews",
             "reservations",
             "blacklist",
+            "wishlist",
+            "wishlist_tags",
         }
         rows = await db.fetch_all(
             "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
@@ -1205,3 +1207,81 @@ class TestVisitCuisineField:
         visits = await db.get_visits_for_restaurant("place_vc")
         assert len(visits) == 1
         assert visits[0].cuisine == "french"
+
+
+# ── Wishlist ────────────────────────────────────────────────────────────────
+
+
+class TestWishlist:
+    async def test_add_to_wishlist(self, db: DatabaseManager):
+        wid = await db.add_to_wishlist("place_w1", "Wish Place", "try the pasta", ["italian"])
+        assert isinstance(wid, int)
+        assert wid > 0
+        assert await db.is_on_wishlist("place_w1")
+
+    async def test_add_to_wishlist_upsert(self, db: DatabaseManager):
+        wid1 = await db.add_to_wishlist("place_w2", "Upsert Place", "old notes", ["old"])
+        wid2 = await db.add_to_wishlist("place_w2", "Upsert Place", "new notes", ["new"])
+        assert wid1 == wid2
+        items = await db.get_wishlist()
+        assert len(items) == 1
+        assert items[0].notes == "new notes"
+        assert items[0].tags == ["new"]
+
+    async def test_remove_from_wishlist_found(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w3", "Remove Place", None, [])
+        removed = await db.remove_from_wishlist("place_w3")
+        assert removed is True
+        assert not await db.is_on_wishlist("place_w3")
+
+    async def test_remove_from_wishlist_not_found(self, db: DatabaseManager):
+        removed = await db.remove_from_wishlist("nonexistent")
+        assert removed is False
+
+    async def test_get_wishlist_empty(self, db: DatabaseManager):
+        items = await db.get_wishlist()
+        assert items == []
+
+    async def test_get_wishlist_with_items(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w4", "A Place", "note a", ["tag1"])
+        await db.add_to_wishlist("place_w5", "B Place", "note b", ["tag2"])
+        items = await db.get_wishlist()
+        assert len(items) == 2
+        names = {item.restaurant_name for item in items}
+        assert names == {"A Place", "B Place"}
+
+    async def test_get_wishlist_filtered_by_tag(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w6", "Brunch Spot", None, ["brunch"])
+        await db.add_to_wishlist("place_w7", "Dinner Spot", None, ["dinner"])
+        items = await db.get_wishlist(tag="brunch")
+        assert len(items) == 1
+        assert items[0].restaurant_name == "Brunch Spot"
+
+    async def test_is_on_wishlist_true(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w8", "Listed", None, [])
+        assert await db.is_on_wishlist("place_w8") is True
+
+    async def test_is_on_wishlist_false(self, db: DatabaseManager):
+        assert await db.is_on_wishlist("nonexistent") is False
+
+    async def test_get_wishlist_restaurant_ids(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w9", "A", None, [])
+        await db.add_to_wishlist("place_w10", "B", None, [])
+        ids = await db.get_wishlist_restaurant_ids()
+        assert ids == {"place_w9", "place_w10"}
+
+    async def test_get_wishlist_restaurant_ids_empty(self, db: DatabaseManager):
+        ids = await db.get_wishlist_restaurant_ids()
+        assert ids == set()
+
+    async def test_cascade_delete_tags(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w11", "Cascade", None, ["tag1", "tag2"])
+        await db.remove_from_wishlist("place_w11")
+        # Tags should be gone due to ON DELETE CASCADE
+        rows = await db.fetch_all("SELECT * FROM wishlist_tags")
+        assert rows == []
+
+    async def test_tag_normalization(self, db: DatabaseManager):
+        await db.add_to_wishlist("place_w12", "Tags", None, ["Date Night", "BRUNCH"])
+        items = await db.get_wishlist()
+        assert set(items[0].tags) == {"date night", "brunch"}

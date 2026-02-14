@@ -38,6 +38,7 @@ async def _score_restaurant(
     avoided_cuisines: set[str],
     recency_penalties: dict[str, float],
     review_map: dict[str, dict],
+    wishlist_ids: set[str] | None = None,
 ) -> tuple[float, str]:
     """Score a restaurant and return (score, reason).
 
@@ -83,6 +84,11 @@ async def _score_restaurant(
         else:
             score -= 50
             reasons.append("You wouldn't return — skipping")
+
+    # Wishlist boost
+    if wishlist_ids and restaurant.id in wishlist_ids:
+        score += 15
+        reasons.append("On your wishlist")
 
     # Occasion matching
     if occasion:
@@ -242,6 +248,9 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
         for r in results:
             await db.cache_restaurant(r)
 
+        # Wishlist IDs for scoring boost
+        wishlist_ids = await db.get_wishlist_restaurant_ids()
+
         # Filter and score
         scored: list[tuple[float, str, Restaurant]] = []
         for r in results:
@@ -276,7 +285,7 @@ def register_recommendation_tools(mcp: FastMCP) -> None:  # noqa: C901
             s, reason = await _score_restaurant(
                 r, user_lat, user_lng, occasion,
                 favorite_cuisines, liked_cuisines, avoided_cuisines,
-                recency_penalties, review_map,
+                recency_penalties, review_map, wishlist_ids,
             )
             scored.append((s, reason, r))
 

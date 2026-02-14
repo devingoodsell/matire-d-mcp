@@ -138,6 +138,22 @@ CREATE TABLE IF NOT EXISTS blacklist (
     added_date TEXT DEFAULT (date('now'))
 );
 
+-- Wishlist
+CREATE TABLE IF NOT EXISTS wishlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    restaurant_id TEXT NOT NULL UNIQUE,
+    restaurant_name TEXT NOT NULL,
+    notes TEXT,
+    added_date TEXT DEFAULT (date('now'))
+);
+
+CREATE TABLE IF NOT EXISTS wishlist_tags (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    wishlist_id INTEGER NOT NULL REFERENCES wishlist(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    UNIQUE(wishlist_id, tag)
+);
+
 -- API call logging (cost tracking)
 CREATE TABLE IF NOT EXISTS api_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -161,3 +177,6 @@ CREATE INDEX IF NOT EXISTS idx_visits_date ON visits(date);
 CREATE INDEX IF NOT EXISTS idx_restaurant_cache_name ON restaurant_cache(name);
 CREATE INDEX IF NOT EXISTS idx_api_calls_provider ON api_calls(provider, created_at);
 CREATE INDEX IF NOT EXISTS idx_reservations_date ON reservations(date);
+CREATE INDEX IF NOT EXISTS idx_wishlist_restaurant ON wishlist(restaurant_id);
+CREATE INDEX IF NOT EXISTS idx_wishlist_tags_wishlist ON wishlist_tags(wishlist_id);
+CREATE INDEX IF NOT EXISTS idx_wishlist_tags_tag ON wishlist_tags(tag);
